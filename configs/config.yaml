@@ -1,0 +1,1712 @@
+# customer-success — Customer Success (proactive retention)
+#
+# Watches the whole customer base for risk signals BEFORE customers
+# escalate or churn. A TEAM of agents talking peer-to-peer (Rule 1):
+# health-score → risk-detector → (play matrix on its edges) →
+# save-play / QBR / renewals → CSM, with multiple entry points
+# (telemetry, billing, support thresholds, scheduled sweeps, renewal
+# windows, exec-change CRM updates).
+#
+# DEEP AND USABLE: the play-matrix, ARR tiers and renewal windows a VP
+# of Customer Success would recognise live in prompts/conditions for the
+# LLM to reason over AND are enforced as deterministic floors the LLM
+# can't waive — in `@chain` steps inside agency/*_agent.py (band/safety
+# floors, strategic-review gate, exec-signature, the bounded save-play
+# touch loop, the renewal strategic safeguard + window date gate). The
+# self-reliant agents pull their own context (`@pre_compose`) from a dev
+# store seeded with realistic accounts, so the FULL chain runs day-0 with
+# NO connectors. In production, health / CSAT / telemetry / renewal state
+# lives in YOUR CRM / CS platform (Gainsight, Salesforce, Pendo/Amplitude,
+# Klue) — reached through n8n connector agents; the store's function
+# signatures are the contract you swap them into.
+#
+# Distinct from `customer-support` — support is reactive (a ticket
+# just came in); customer-success is PROACTIVE (the customer hasn't
+# complained yet — and we want to act before they do).
+#
+# ═══════════════════════════════════════════════════════════════════
+# WHY LEAFMESH (the value the ROI calculator quantifies)
+# ═══════════════════════════════════════════════════════════════════
+# Customer Success is the SaaS "biggest single prize" per the ROI
+# doc — protecting revenue you already have. Pool ~8% of revenue,
+# routine share 45%, customer visibility. The control-plane
+# primitives this template uses:
+#
+#   1. PEER-TO-PEER mesh — health_score talks directly to
+#      risk_detector; risk_detector's outbound edges ARE the play
+#      matrix; save_play reaches the right CSM tier. The Manager is
+#      the supervisor, not the router.
+#   2. MULTI-ENTRY — 8 entry points (telemetry signals, billing
+#      events, support escalations, scheduled sweeps, QBR cadence,
+#      renewal windows, exec-change CRM updates, manual triggers).
+#      The team can act from any signal.
+#   3. PROACTIVE not reactive — scheduled wake-ups continuously
+#      sweep the base. No need to wait for a customer message.
+#   4. HITL gates on every customer-facing action — save-play
+#      drafts go to the CSM; QBR drafts get reviewed; renewal
+#      forecasts confirm with the renewals manager.
+#   5. KNOWLEDGE-GROUNDED — health-score rules, save-play library,
+#      QBR template, segment definitions all live in the customer's
+#      knowledge base. Updates propagate instantly.
+#   6. Bidirectional collaboration — risk_detector can call
+#      account_intel_agent for stakeholder context; QBR drafter
+#      can call cs_operations for fresh usage data; save_play can
+#      call renewals_agent for context.
+#   7. CRON CITIZENS — the renewals_agent daily window detection
+#      runs in parallel to the per-event flow (the cs_operations
+#      and onboarding sweeps wake up once their n8n connectors to
+#      your analytics / CRM stack are wired).
+#   8. Event-bus subscribers — every escalation, intervention,
+#      save-play sent is audited out-of-band for QBR reporting.
+
+name: "customer-success"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+# ═══════════════════════════════════════════════════════════════════
+# REDIS — health-score cache, customer context, save-play history
+# ═══════════════════════════════════════════════════════════════════
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400              # keep customer state for a day across signals
+  session_ttl: 604800             # 7 days — long enough for save-play follow-through
+
+# ═══════════════════════════════════════════════════════════════════
+# AUTO-DISCOVER
+# ═══════════════════════════════════════════════════════════════════
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+# ═══════════════════════════════════════════════════════════════════
+# MANAGER — supervisor, watches for save-play patterns + escalations
+# ═══════════════════════════════════════════════════════════════════
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+
+  prompt: |
+    This mesh runs proactive customer success. A successful customer
+    lifecycle:
+      - health_score continuously aggregates usage, support, billing
+      - risk_detector identifies degraded accounts BEFORE they churn;
+        the play matrix on its outbound edges picks the intervention
+        (save / QBR / renewal — one conditional wire per matrix row)
+      - save_play / qbr / renewals_agent draft the action
+      - the right CSM tier reviews + sends (HITL — we never auto-message customers)
+      - account_intel watches CRM for stakeholder turnover (champion left → risk)
+        and scans for expansion signals (upsell is a sales motion → AE)
+
+    Escalate when:
+      - any account >$100K ARR drops health_score by >20 points in 30 days
+      - any account with risk_score >= 0.7 has had no CSM touch in 14 days
+      - renewals_agent confidence drops below 0.5 within 90 days of renewal
+      - account_intel detects executive champion turnover with no successor
+      - save_play sequences fail (no customer response after 3 touches)
+
+    Watch for:
+      - save-play patterns that don't work (drop them from the library)
+      - segments where health-score under-predicts churn (recalibrate)
+      - CSM-book imbalance (one CSM handling all the saves; redistribute)
+      - QBR no-shows trending up (relationship signal — escalate)
+
+  routing:
+    mode: "learning"           # CS plays are learnable; let the Manager adapt
+    memory_size: 300           # CS decisions are slower → longer memory pays
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 60
+
+  # Manager-level knowledge — Summarizer reads the CS playbook + segmentation
+  # rules + executive engagement protocol on every analysis turn
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "cs_playbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "vp_cs_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{customer_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_CS_CHANNEL:}"
+        message_template: "[customer-success] {{message}} — customer {{customer_id}} (session {{session_id}})"
+
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+# ═══════════════════════════════════════════════════════════════════
+# MESH
+# ═══════════════════════════════════════════════════════════════════
+mesh:
+  call_timeout: 120
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ═══════════════════════════════════════════════════════════════════
+data_structures:
+  CustomerEvent:
+    type: "object"
+    properties:
+      customer_id: { type: "string" }
+      account_id: { type: "string" }
+      signal_source: { type: "string" }            # telemetry | billing | support | scheduled | renewal | exec_change | manual
+      signal_type: { type: "string" }              # usage_drop | failed_payment | ticket_spike | qbr_due | champion_left | …
+      arr_cents: { type: "number" }                # annual recurring revenue
+      segment: { type: "string" }                  # enterprise | mid_market | smb
+      tier: { type: "string" }                     # named_account | standard | tech_touch
+      received_at_utc: { type: "string" }
+      raw_payload: { type: "object" }
+    required: ["customer_id", "signal_source"]
+
+  HealthVerdict:
+    type: "object"
+    properties:
+      health_score: { type: "number" }             # 0..100
+      score_delta_30d: { type: "number" }          # -100..+100
+      risk_band: { type: "string" }                # healthy | watch | at_risk | critical
+      contributing_factors: { type: "list" }
+      confidence: { type: "number" }
+    required: ["health_score", "risk_band", "confidence"]
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRY POINTS — Rule 1: 8 different ways the team can be triggered
+# ═══════════════════════════════════════════════════════════════════
+entry_points:
+  - name: "product_telemetry"
+    target: "health_score_agent"
+    description: "Product event (login frequency drop, feature abandonment, low DAU)"
+
+  - name: "billing_event"
+    target: "health_score_agent"
+    description: "Billing event (failed payment, downgrade, contract approach)"
+
+  - name: "support_threshold"
+    target: "risk_detector_agent"
+    description: "Support volume crossed account-level threshold (e.g., 5 tickets in 7 days)"
+
+  - name: "csat_drop_signal"
+    target: "risk_detector_agent"
+    description: "CSAT score dropped >1 point quarter-over-quarter — risk re-detection"
+
+  - name: "nps_score_dip"
+    target: "risk_detector_agent"
+    description: "NPS detractor reported (≤6) — risk re-detection with sentiment context"
+
+  - name: "usage_anomaly"
+    target: "risk_detector_agent"
+    description: "Telemetry: engagement drop > 30% week-over-week — risk re-evaluation"
+
+  - name: "scheduled_health_sweep"
+    target: "cs_operations_agent"
+    description: "Proactive sweep across the whole base (mode=sweep) — catches the slow decline"
+
+  - name: "qbr_due"
+    target: "qbr_drafter_agent"
+    description: "Calendar trigger — QBR is due for this account"
+
+  - name: "renewal_window"
+    target: "renewals_agent"
+    description: "Account is N days from renewal — start the forecast + outreach"
+
+  - name: "exec_change"
+    target: "account_intel_agent"
+    description: "CRM detected exec / champion turnover — stakeholder map needs reset (mode=stakeholder)"
+
+  - name: "manual_cs_action"
+    target: "risk_detector_agent"
+    description: "CSM-initiated action (override, manual play trigger) — risk_detector names the pattern; the play matrix on its edges picks the play"
+
+  - name: "explain_health_score"
+    target: "health_score_agent"
+    description: "CSM or sales requests the 'why' behind a health score (scored + explained in one pass)"
+
+  - name: "usage_metrics_pull"
+    target: "cs_operations_agent"
+    description: "Pull product-telemetry analytics for one account (mode=analytics) — DAU, feature breadth, quiet runs"
+
+  - name: "expansion_scan"
+    target: "account_intel_agent"
+    description: "Scan one account for upsell + cross-sell signals (mode=expansion) — routes to AE on high score"
+
+# ═══════════════════════════════════════════════════════════════════
+# AGENTS — The team (YAML-first)
+#
+# Mesh shape (peer-to-peer, Rule 1):
+#
+#   any of the entry_points
+#     → health_score_agent (pure-YAML LLM, knowledge: health_rules)
+#         │
+#         ▼ on band change or score drop
+#       risk_detector_agent (pure-YAML LLM, knowledge: risk_patterns)
+#         ├── on champion-loss signal → account_intel_agent (peer, mode=stakeholder)
+#         ├── PLAY MATRIX (one conditional edge per row — the former
+#         │   playbook_trigger_agent, now visible wiring):
+#         │     pattern=save rows    → save_play_agent (LLM)
+#         │     pattern=qbr rows     → qbr_drafter_agent (LLM)
+#         │     approaching_renewal  → renewals_agent (LLM)
+#         │     hold rows            → cs_audit_logger (terminate)
+#         └── requires_human_review  → senior_csm_human
+#
+#       save_play / qbr / renewals → the CSM tiers (HITL)
+#         ├── csm_human         (standard accounts)
+#         ├── senior_csm_human  (named accounts)
+#         ├── renewals_manager  (renewal window)
+#         ├── ae_human          (expansion plays)
+#         └── vp_cs_human       (board-visibility / strategic)
+#
+#       all terminuses → cs_audit_logger (hash-chained WORM)
+#
+#   Connector agents (pure YAML — n8n reaches YOUR systems; no Python):
+#     - cs_operations_agent       → Pendo / Amplitude / Segment
+#     - customer_onboarding_agent → Salesforce / Gainsight
+#     - competitor_intel_agent    → Klue / Crayon
+#
+#   Cron citizens (parallel — NOT in the per-event flow):
+#     - renewals_agent (daily 09:00 window-detection responsibility —
+#       finds accounts entering the 30/60/90-day renewal window)
+#     - cs_operations / onboarding sweeps: wake_up shipped commented;
+#       enable after wiring the n8n connectors.
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_save_play"
+    target: "save_play_agent"
+    description: "On-demand direct call to save_play (llm) — bypasses upstream chain"
+
+  - name: "direct_call_renewals"
+    target: "renewals_agent"
+    description: "On-demand direct call to renewals_agent (llm; mode=window_scan supported) — bypasses upstream chain"
+
+  - name: "direct_call_play_runner"
+    target: "play_runner_agent"
+    description: "On-demand direct call to the play_runner executor — runs an already-approved play (send / book); fails closed if not approved"
+
+  # ── Lyzr-inspired agents (added in 2.3.x) ──
+  - name: "register_post_sale_close"
+    target: "customer_onboarding_agent"
+    description: "Register a closed deal — seeds onboarding milestones (mode=register_close)"
+
+  - name: "milestone_complete"
+    target: "customer_onboarding_agent"
+    description: "Mark an onboarding milestone complete (mode=milestone_complete)"
+
+  - name: "onboarding_daily_sweep"
+    target: "customer_onboarding_agent"
+    description: "Daily sweep — flag overdue milestones, lagging adoption"
+
+  - name: "record_competitor_signal"
+    target: "competitor_intel_agent"
+    description: "Record a competitor mention from CSM call / ticket / G2 (mode=record)"
+
+  - name: "account_displacement_risk"
+    target: "competitor_intel_agent"
+    description: "Compute aggregate displacement risk for an account (mode=account_risk)"
+
+
+agents:
+
+  # ────────────────────────────────────────────────────────────
+  # health_score_agent — self-reliant LLM, aggregates signals →
+  # health 0..100 AND explains the score in plain English (one call
+  # scores + explains — CSMs and sales can quote the 'why'
+  # immediately). agency/health_score_agent.py gives it real hands:
+  #   @pre_compose load_account_context — pulls the rolling 30d signal
+  #     window + usage snapshot from the dev store (PROD: Gainsight/Pendo)
+  #     so it scores over REAL history, plus a deterministic baseline.
+  #   @chain enforce_band_floors — band derivation, the low-confidence
+  #     safety floor and the indefensible-score quality floor are policy
+  #     the LLM CANNOT waive (agency/_shared/health_math.py). The prompt
+  #     still states the rules so the model is grounded; the chain
+  #     guarantees them. risk_band is ALWAYS recomputed, never trusted.
+  # ────────────────────────────────────────────────────────────
+  health_score_agent:
+    name: "health_score_agent"
+    agent_type: "llm"
+    description: "Aggregates usage / support / billing / engagement into a health score AND explains it in plain English"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1500
+    communication_type: "chain"
+
+    prompt: |
+      Two jobs, one pass.
+
+      JOB 1 — score: compute a health score (0..100) for this
+      customer given the latest signal and the rolling 30-day window
+      of prior signals from Redis. Use the health-rules knowledge
+      group for the scoring rubric (factors, weights,
+      segment-specific adjustments).
+
+      The output must include `score_delta_30d` so downstream agents
+      can detect velocity, not just absolute level. A customer at
+      score 80 trending down 15 in 30 days is MORE at risk than one
+      stuck at 65 for months.
+
+      Be conservative on confidence. Confidence < 0.7 means we don't
+      have enough signal — surface that so risk_detector treats it
+      as "needs human review" rather than acting on a guess.
+
+      JOB 2 — explain: translate the score you just computed into a
+      defensible plain-English explanation the CSM can quote:
+        - executive_summary: one paragraph for the CSM to lead with
+          ("ACME is yellow because…")
+        - top_3_contributors: ordered list of {factor, weight_pct,
+          recent_trend} — the biggest drivers in this customer's score
+        - what_changed_30d: list of specific signal changes vs prior period
+        - if_we_did_nothing: forecast of where the score lands in 30d
+          if no intervention
+        - quotable_one_liner: a single sentence the CSM can paste
+          into a sales-team thread
+
+      Honesty over comfort. If we can't explain confidently, say so —
+      a CSM defending an inaccurate score loses credibility fast.
+
+      DETERMINISTIC RULES — apply these exactly, every time:
+        - Clamp health_score to 0..100, score_delta_30d to
+          -100..+100, confidence to 0..1.
+        - risk_band derives from the score (inclusive lower bounds):
+          80..100 → "healthy", 60..79 → "watch", 40..59 → "at_risk",
+          below 40 → "critical". Use ONLY these four band names.
+        - SAFETY FLOOR: if confidence < 0.6 and the band would be
+          "healthy", emit "watch" instead — a low-confidence
+          "healthy" call masks brewing churn.
+        - QUALITY FLOOR: if you cannot produce a non-empty
+          executive_summary AND at least one top_3_contributors
+          entry, the score is indefensible — cap confidence at 0.3
+          (which also triggers the safety floor above).
+        - top_3_contributors carries AT MOST 3 entries.
+        - Echo customer_id, arr_cents and segment UNCHANGED from the
+          incoming customer_event / health_verdict — downstream tier
+          routing gates on them. Default segment "smb" and
+          arr_cents 0 only when the event carries neither.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"health_score": 0, "score_delta_30d": 0, "risk_band": "", "contributing_factors": [], "confidence": 0, "customer_id": "", "arr_cents": 0, "segment": "", "executive_summary": "", "top_3_contributors": [], "what_changed_30d": [], "if_we_did_nothing": "", "quotable_one_liner": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "health_rules"
+
+    yields:
+      health_score: "number"          # 0..100
+      score_delta_30d: "number"       # signed
+      risk_band: "string"             # healthy | watch | at_risk | critical
+      contributing_factors: "list"
+      confidence: "number"            # 0..1
+      customer_id: "string"
+      arr_cents: "number"             # carried for downstream tier routing
+      segment: "string"
+      executive_summary: "string"
+      top_3_contributors: "list"
+      what_changed_30d: "list"
+      if_we_did_nothing: "string"
+      quotable_one_liner: "string"
+
+    inputs:
+      customer_event: "object"
+      health_verdict: "object"
+
+    context_parts:
+      care: |
+        CSMs are the ones taking heat from sales for "wrong" scores.
+        Give them ammunition — be specific, cite signals, avoid jargon.
+      guardrails: |
+        Never compute health from a single signal. The 30-day window
+        is the minimum lookback for the rubric. If history is thin
+        (< 7 signals), set confidence < 0.6 so risk_detector defers
+        to a CSM review rather than firing a save-play.
+      flows: |
+        Source=telemetry → weight engagement signals heavily
+        Source=billing → weight commercial signals (downgrade, failed payment) heavily
+        Source=support → weight support volume + sentiment heavily
+        Source=scheduled → trust the rolling window, no source-specific tilt
+
+    narration: |
+      If the customer is on the strategic accounts list (ARR > $500K)
+      and the score dropped >10 points in 30 days, route directly to
+      senior_csm_human regardless of risk_band — strategic accounts get
+      a higher-touch escalation than standard (this is the
+      strategic-drop edge below, mutually exclusive with the
+      risk_detector edge).
+
+    can_call:
+      # Strategic-drop fast path: ARR > $500K AND score fell >10 points
+      # in 30d → senior CSM directly, regardless of band. Backs the
+      # narration above; mutually exclusive with the risk_detector edge
+      # (that edge excludes this exact case so they can't both fire).
+      - agent: "senior_csm_human"
+        condition: "calling_agent_response.arr_cents >= 50000000 and calling_agent_response.score_delta_30d <= -10"
+
+      # Evaluate risk for any non-healthy band — EXCEPT the strategic-drop
+      # case above, which is already routed to the senior CSM.
+      - agent: "risk_detector_agent"
+        condition: "calling_agent_response.risk_band != 'healthy' and not (calling_agent_response.arr_cents >= 50000000 and calling_agent_response.score_delta_30d <= -10)"
+
+      # If score is healthy AND confidence is high, terminate cleanly to audit
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.risk_band == 'healthy' and calling_agent_response.confidence >= 0.7"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # risk_detector_agent — self-reliant LLM, identifies risk patterns.
+  # Its outbound can_call edges carry the PLAY MATRIX (the former
+  # playbook_trigger_agent) — one visible conditional wire per matrix
+  # row. agency/risk_detector_agent.py gives it hands:
+  #   @pre_compose load_risk_context — pulls prior plays + the last
+  #     health snapshot so the LLM reasons over what's been tried.
+  #   @chain enforce_strategic_review — DETERMINISTIC floors the matrix
+  #     relies on: strategic accounts (ARR>=$250K) with severity ALWAYS
+  #     require human review; exec_turnover ALWAYS sets the stakeholder
+  #     map; an invalid pattern name collapses to hold (never fires the
+  #     wrong play). The prompt asks; the chain guarantees.
+  # ────────────────────────────────────────────────────────────
+  risk_detector_agent:
+    name: "risk_detector_agent"
+    agent_type: "llm"
+    description: "Identifies risk patterns (usage decay, exec turnover, ticket spike, support drag); its outbound edges carry the play matrix"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1000
+    communication_type: "dual"             # bidirectional — can call account_intel
+
+    prompt: |
+      Identify the specific risk PATTERN(S) at play given the health
+      verdict + recent signal log. You produce:
+        - patterns: list of {pattern, severity, evidence}
+          pattern MUST be exactly one of: usage_decay |
+          feature_abandonment | support_drag | billing_friction |
+          exec_turnover | silent_disengagement | product_misfit |
+          competitor_in_account. NEVER invent a pattern name — the
+          pattern string drives the play matrix on this agent's
+          outbound edges; an unrecognised name routes to hold/audit.
+          Drop any candidate that doesn't fit one of these labels.
+        - primary_pattern: the single pattern with the HIGHEST
+          severity (empty string "" with primary_severity 0 when no
+          valid pattern is found)
+        - primary_severity: 0..1 of primary (clamp every severity
+          to 0..1)
+        - requires_stakeholder_map: true if champion-loss / exec turnover detected
+        - requires_human_review: true on low confidence OR strategic account
+        - customer_id: pass-through from health verdict
+        - arr_cents: pass-through
+        - segment: pass-through
+        - csm_briefing: 3-5 sentence narrative for the CSM. Lead with
+          the pattern + severity. Cite 1-2 specific signals (with dates
+          if available). Say what intervention you'd recommend. Make
+          it copy-pasteable into a Slack message to sales.
+
+      Don't restate the band — name the pattern. If exec_turnover
+      detected, also call account_intel_agent (stakeholder mode).
+
+      DETERMINISTIC RULES — apply these exactly, every time:
+        - exec_turnover anywhere in patterns → requires_stakeholder_map
+          MUST be true.
+        - STRATEGIC ACCOUNTS: arr_cents >= 25000000 ($250K ARR) with
+          primary_severity >= 0.3 → requires_human_review MUST be
+          true. Strategic drift always gets a human before a play
+          fires.
+        - Echo customer_id, arr_cents and segment UNCHANGED from the
+          upstream health verdict — the play matrix below gates on
+          arr_cents.
+        - csm_briefing must never be empty when a pattern is named.
+          If you have little to say, state at minimum: the primary
+          pattern + severity, the ARR + segment, and whether you
+          recommend human review or the standard play.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"patterns": [], "primary_pattern": "", "primary_severity": 0, "requires_stakeholder_map": false, "requires_human_review": false, "customer_id": "", "arr_cents": 0, "segment": "", "csm_briefing": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "risk_patterns"
+
+    yields:
+      patterns: "list"                     # list of {pattern, severity, evidence}
+      primary_pattern: "string"
+      primary_severity: "number"           # 0..1
+      requires_stakeholder_map: "boolean"  # true when champion-loss / exec turnover detected
+      requires_human_review: "boolean"     # true on low confidence or strategic account
+      customer_id: "string"
+      arr_cents: "number"
+      segment: "string"
+      csm_briefing: "string"               # the narrative CSM reads/pastes
+
+    inputs:
+      upstream_yields: "object"
+
+    context_parts:
+      guardrails: |
+        Never draft the outreach — that's save_play / qbr_drafter's
+        job. Your job is naming the pattern accurately: the pattern
+        string IS the play selector (the matrix lives on your
+        outbound edges), so inaccurate pattern labels fire the
+        wrong play.
+      flows: |
+        Source=scheduled → look across the full 30-day window
+        Source=billing → bias toward billing_friction patterns
+        Source=exec_change → set requires_stakeholder_map=true automatically
+        Source=onboarding sweep (overdue milestones / lagging adoption)
+          → these are early-lifecycle accounts; silent_disengagement
+          or product_misfit are the usual fits
+
+    narration: |
+      A "competitor_in_account" pattern fires the immediate save-play
+      row of the matrix below (→ save_play_agent), and save_play routes
+      the draft to the CSM tier for review before any customer contact.
+      Sales-side awareness of competitor presence is carried by the
+      competitor_intel_agent connector path (its account_risk mode
+      alerts the AE), not by a second human edge here — keeping one
+      route per matrix row.
+      Urgency guidance for the play the matrix fires (from the CS
+      playbook): billing_friction / exec_turnover /
+      competitor_in_account are immediate; silent_disengagement,
+      support_drag and high-severity usage_decay are this_week;
+      feature_abandonment, product_misfit and moderate usage_decay
+      are this_month — except strategic accounts (ARR > $250K),
+      which uplift this_month to this_week.
+
+    can_call:
+      # Peer-to-peer: call account_intel (stakeholder mode) when
+      # champion change detected
+      - agent: "account_intel_agent"
+        condition: "calling_agent_response.requires_stakeholder_map == true"
+
+      # Low-confidence or strategic-account drift goes to senior CSM
+      - agent: "senior_csm_human"
+        condition: "calling_agent_response.requires_human_review == true"
+
+      # ═══════════ PLAY MATRIX (absorbed playbook_trigger_agent) ═══════════
+      # pattern × severity × ARR → play. One edge per matrix row; the
+      # original module row is quoted above each condition. Every row
+      # is gated on "clear pattern, no human review needed"
+      # (primary_severity >= 0.3 and requires_human_review == false) —
+      # exactly the gate that used to guard the playbook call.
+
+      # row: billing_friction → save (immediate)
+      #      "billing friction is the strongest leading churn indicator"
+      - agent: "save_play_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'billing_friction'"
+
+      # row: exec_turnover → save (immediate) — "relationship reset"
+      - agent: "save_play_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'exec_turnover'"
+
+      # row: competitor_in_account → save (immediate)
+      #      "competitor signal — sales + CS in parallel"
+      - agent: "save_play_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'competitor_in_account'"
+
+      # row: usage_decay, severity >= 0.6, ARR >= $50K → save (this_week)
+      #      "usage decay sev=X on $Y account"
+      - agent: "save_play_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_pattern == 'usage_decay' and calling_agent_response.primary_severity >= 0.6 and calling_agent_response.arr_cents >= 5000000"
+
+      # row: usage_decay, 0.3 <= severity < 0.6 → qbr (this_month)
+      #      "moderate usage decay — QBR is the right re-engagement"
+      - agent: "qbr_drafter_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_pattern == 'usage_decay' and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_severity < 0.6"
+
+      # row: feature_abandonment → qbr (this_month)
+      #      "feature abandonment — QBR + roadmap conversation"
+      - agent: "qbr_drafter_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'feature_abandonment'"
+
+      # row: silent_disengagement → qbr (this_week)
+      #      "silence is a signal — re-engage before it becomes churn"
+      - agent: "qbr_drafter_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'silent_disengagement'"
+
+      # row: support_drag → qbr (this_week)
+      #      "support burden — QBR with product feedback"
+      - agent: "qbr_drafter_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'support_drag'"
+
+      # row: product_misfit → qbr (this_month)
+      #      "product fit conversation — set expectations"
+      - agent: "qbr_drafter_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'product_misfit'"
+
+      # row: approaching_renewal → renewal (this_week) — from the
+      #      playbook's selection matrix; the renewal_window entry
+      #      point usually drives renewals_agent directly, this wire
+      #      preserves the matrix route for risk-detected renewals
+      - agent: "renewals_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern == 'approaching_renewal'"
+
+      # row (hold): usage_decay, severity >= 0.6 but ARR < $50K →
+      #      hold → audit ("not enough signal — wait for next sweep";
+      #      the original matrix only fired the save on >= $50K ARR)
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_pattern == 'usage_decay' and calling_agent_response.primary_severity >= 0.6 and calling_agent_response.arr_cents < 5000000"
+
+      # row (default/fallback): clear pattern but no matrix row matched
+      #      → hold → audit ("no clear pattern — wait for next sweep")
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.primary_severity >= 0.3 and calling_agent_response.primary_pattern != 'billing_friction' and calling_agent_response.primary_pattern != 'exec_turnover' and calling_agent_response.primary_pattern != 'competitor_in_account' and calling_agent_response.primary_pattern != 'usage_decay' and calling_agent_response.primary_pattern != 'feature_abandonment' and calling_agent_response.primary_pattern != 'silent_disengagement' and calling_agent_response.primary_pattern != 'support_drag' and calling_agent_response.primary_pattern != 'product_misfit' and calling_agent_response.primary_pattern != 'approaching_renewal'"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # account_intel_agent — self-reliant, mode-dispatched account
+  # intelligence. 2.3.x consolidation: absorbed the expansion-signal
+  # scanner + the exec-alignment stakeholder mapper — one analyst
+  # role reading the same account signals in two directions. The
+  # expansion floors + two-signal rule that used to live in
+  # agency/account_intel_agent.py stay explicit prompt rules; the
+  # module now carries one hand:
+  #   @pre_compose load_intel_context — resolve the mode (same
+  #     precedence as the prompt) and pull the matching slice from the
+  #     store: expansion → seat/API util + premium features touched;
+  #     stakeholder → the current stakeholder map + recent signals.
+  #     So the analyst reasons over the real account record, not just
+  #     whatever the inbound event carried.
+  # ────────────────────────────────────────────────────────────
+  account_intel_agent:
+    name: "account_intel_agent"
+    agent_type: "llm"
+    description: "Account intelligence analyst — scans for expansion / upsell signals (mode=expansion) and confirms champion changes + rebuilds the stakeholder map (mode=stakeholder)"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1200
+    communication_type: "dual"
+
+    prompt: |
+      You are the account intelligence analyst. One role, two
+      responsibilities — the input decides which one this request
+      needs (intel_mode: expansion | stakeholder).
+
+      Your tools have already pulled this account's real data for the
+      resolved mode (prepared context): in expansion mode, the
+      account's seat/API utilisation + premium features touched; in
+      stakeholder mode, the current stakeholder map (who's in role, who
+      departed, who holds buying authority) + the recent signal window.
+      Reason over THAT pulled data — it is the source of truth, not any
+      numbers the inbound event happened to restate.
+
+      MODE SELECTION — apply in this order:
+        1. An explicit mode / intel_mode field anywhere in the input
+           wins.
+        2. An upstream requires_stakeholder_map=true flag
+           (risk_detector / onboarding / competitor_intel peer
+           calls) → stakeholder.
+        3. Exec-change hints in the event (signal_source /
+           signal_type / event_type mentioning champion, exec,
+           stakeholder, or exec_change) → stakeholder.
+        4. Otherwise → expansion.
+
+      1. EXPANSION SCANNING (intel_mode=expansion) — scan the
+         customer's usage + billing signals for upsell and
+         cross-sell opportunities. Read from the signals:
+           - seat utilisation: 0..1 — actual / contracted seats
+           - API utilisation: 0..1 — rolling 7d / plan limit
+           - premium-tier feature names the customer is touching on
+             their current plan
+         DETERMINISTIC EXPANSION FLOOR — always add these
+         upsell_signals when the threshold is met (each an object
+         {kind, evidence, size_hint}; never duplicate a kind):
+           - seat utilisation >= 0.85 → kind "seat_expansion",
+             size_hint "+10-25% seats"
+           - API utilisation >= 0.80 (rolling 7d) → kind
+             "tier_upgrade_api", size_hint "next tier"
+           - 1+ premium features touched → kind
+             "tier_upgrade_features", size_hint "next tier"
+         Then compute, exactly:
+           - expansion_score = min(1.0, 0.25 × count(upsell_signals)
+             + 0.2 × count(cross_sell_signals))
+           - ae_action_required = expansion_score >= 0.5
+           - expansion_briefing: 3 sentence narrative for the AE.
+             Lead with the strongest signal. Cite specifics (numbers,
+             features). Recommend the next sales motion. Never leave
+             it empty — at minimum state the score and the signal
+             kinds found (or "no upsell signals").
+         cross_sell_signals are objects {kind, evidence, product_hint}.
+
+      2. STAKEHOLDER ALIGNMENT (intel_mode=stakeholder) — a signal
+         suggests our champion or another exec stakeholder changed
+         roles or left (CRM update, LinkedIn signal, email bounce,
+         declined QBR). Confirm the change against CRM and rebuild
+         the stakeholder map:
+           - who's still in role (verified)
+           - who has the buying authority NOW
+           - who do we need to re-engage
+           - is there a successor identified or is the seat empty
+         DETERMINISTIC STAKEHOLDER RULES — apply exactly:
+           - TWO-SIGNAL RULE: change_confirmed may be true ONLY with
+             an explicit CRM confirmation OR at least 2 independent
+             corroborating signals (e.g. LinkedIn + email bounce).
+             A single non-CRM signal NEVER confirms — false
+             positives trigger outreach that damages trust.
+           - change_confirmed with no new_champion_candidate →
+             authority_gap MUST be true (empty seat = authority gap
+             by definition).
+           - recommendation: "introduce_successor" when confirmed
+             with an authority gap; "re_engage" when confirmed
+             without one; "hold" when not confirmed.
+
+      Fill the keys of the mode you are NOT in with vacuous defaults
+      — false, "", 0, empty lists ("hold" for recommendation) — so
+      the mode-gated edges can never cross-fire. Always echo
+      customer_id unchanged from the input.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"intel_mode": "", "customer_id": "", "expansion_score": 0, "upsell_signals": [], "cross_sell_signals": [], "ae_action_required": false, "expansion_briefing": "", "change_confirmed": false, "former_champion": "", "new_champion_candidate": "", "authority_gap": false, "recommendation": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    # knowledge groupName choice: kept stakeholder_protocol (from
+    # the absorbed stakeholder mapper) — the two-signal confirmation
+    # protocol is the judgment the LLM must ground; the expansion
+    # floor thresholds are explicit deterministic prompt rules.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "stakeholder_protocol"
+
+    yields:
+      intel_mode: "string"                 # expansion | stakeholder
+      # expansion responsibility
+      customer_id: "string"
+      expansion_score: "number"
+      upsell_signals: "list"
+      cross_sell_signals: "list"
+      ae_action_required: "boolean"
+      expansion_briefing: "string"
+      # stakeholder responsibility
+      change_confirmed: "boolean"
+      former_champion: "string"
+      new_champion_candidate: "string"
+      authority_gap: "boolean"             # true if buying authority is unclear
+      recommendation: "string"             # re_engage | introduce_successor | hold
+
+    inputs:
+      upstream_yields: "object"
+      mode: "string"
+
+    context_parts:
+      guardrails: |
+        Stakeholder mode: never act on a single signal — wait for
+        CRM confirmation OR a second corroborating signal (LinkedIn
+        + email bounce, or CRM + missed QBR). Stakeholder outreach
+        mistakes cost trust.
+        Expansion mode: expansion is a sales motion, not a retention
+        motion — high-score accounts route to the AE, never straight
+        to customer outreach.
+
+    can_call:
+      # ── expansion mode edges (mode-gated so stakeholder runs
+      #    can't cross-fire them) ──
+      # High expansion score → AE
+      - agent: "ae_human"
+        condition: "calling_agent_response.intel_mode == 'expansion' and calling_agent_response.ae_action_required == true"
+
+      # ── stakeholder mode edges ──
+      # Authority gap is highest-touch — strategic CSM gets it
+      - agent: "senior_csm_human"
+        condition: "calling_agent_response.intel_mode == 'stakeholder' and calling_agent_response.authority_gap == true and calling_agent_response.change_confirmed == true"
+
+      # Confirmed change without authority gap → standard CSM re-engages
+      - agent: "csm_human"
+        condition: "calling_agent_response.intel_mode == 'stakeholder' and calling_agent_response.change_confirmed == true and calling_agent_response.authority_gap == false"
+
+      # Below-threshold expansion scan OR unconfirmed stakeholder
+      # signal → terminate to audit; CSM gets it via the daily
+      # digest, not as an alert
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.intel_mode == 'expansion' and calling_agent_response.ae_action_required == false or calling_agent_response.intel_mode == 'stakeholder' and calling_agent_response.change_confirmed == false"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # save_play_agent — self-reliant LLM, drafts at-risk outreach.
+  # agency/save_play_agent.py gives it hands:
+  #   @pre_compose load_play_history — prior plays + the running touch
+  #     count (session stash) so it knows this is touch N, not a first.
+  #   @chain enforce_exec_signature_and_cap — channel/role whitelists,
+  #     the exec-signature ARR floor, the thin-draft quality floor, AND
+  #     the BOUNDED touch loop (Rule 3): past the cap the play is forced
+  #     to a senior CSM with an escalation_reason — the Manager's "no
+  #     response after 3 touches" rule, ENFORCED.
+  #   @compose — csm/senior get the draft; vp gets the escalation brief.
+  # ────────────────────────────────────────────────────────────
+  save_play_agent:
+    name: "save_play_agent"
+    agent_type: "llm"
+    description: "Drafts the right save-play given the pattern, customer history, save-play library"
+    model: "gpt-4o-mini"
+    temperature: 0.3                   # some creativity for personalization
+    max_tokens: 1000
+    communication_type: "dual"          # can call renewals_agent for context
+
+    prompt: |
+      Draft a save-play outreach for this at-risk customer. The
+      output is NEVER sent directly — it goes to the CSM tier for
+      review. Your job is to give the CSM something good to start
+      from, not something to ship.
+
+      Pull from the save-play library (knowledge group) for proven
+      patterns. Personalise to:
+        - the specific pattern (usage_decay vs billing vs exec_turnover)
+        - their tier + ARR
+        - their last 30 days of activity
+        - any known custom feedback (NPS comments, support tickets)
+
+      Be specific. "Hi {{name}}, hope you're well!" is a non-draft.
+      "Hi Sarah — noticed your team's daily logins are down 40%
+      since the API change in March, and I want to make sure that's
+      not something we need to fix on our side." is a draft.
+
+      Include 2-3 alternative angles the CSM can pick from. Add a
+      clear ask ("can we get 15 min this week?") and a backup
+      ("if not, here are 3 quick wins you can try").
+
+      DETERMINISTIC RULES — apply these exactly, every time:
+        - proposed_channel is exactly one of: email | slack | call |
+          inperson. Default "email" when unsure.
+        - recipient_role is exactly one of: champion | exec_sponsor |
+          new_contact. Default "champion" when unsure.
+        - urgency follows the play matrix that routed here:
+          billing_friction / exec_turnover / competitor_in_account →
+          "immediate"; high-severity usage_decay → "this_week";
+          everything else → "this_week" unless context clearly says
+          "this_month". Strategic accounts (ARR > $250K) uplift
+          this_month → this_week.
+        - EXEC-SIGNATURE RULE: arr_cents >= 50000000 ($500K ARR)
+          AND urgency "immediate" → requires_executive_signature
+          MUST be true (VP CS personal-note territory). You may also
+          set it true for relationship reasons on smaller accounts.
+        - QUALITY FLOOR: if your primary_draft is under 60 characters
+          or reads templated, set recipient_role to "exec_sponsor" so
+          a senior CSM reviews it — a thin draft must never go out on
+          the standard path.
+        - Echo customer_id unchanged from upstream (the CSM-tier
+          inboxes declare it as an input).
+        - draft: the same text as primary_draft (the CSM inbox reads
+          this key).
+        - escalation_reason: one sentence on why this play needs
+          senior/VP attention; "" when it doesn't.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"primary_draft": "", "alternative_angles": [], "proposed_channel": "", "urgency": "", "recipient_role": "", "requires_executive_signature": false, "customer_id": "", "draft": "", "escalation_reason": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "save_play_library"
+
+    yields:
+      primary_draft: "string"
+      alternative_angles: "list"
+      proposed_channel: "string"        # email | slack | call | inperson
+      urgency: "string"
+      recipient_role: "string"          # champion | exec_sponsor | new_contact
+      requires_executive_signature: "boolean"  # true for high-ARR plays
+      # Identity passthrough — CSM-tier / VP inboxes declare these inputs
+      customer_id: "string"
+      draft: "string"
+      escalation_reason: "string"
+
+    inputs:
+      upstream_yields: "object"
+
+    context_parts:
+      care: |
+        At-risk customers feel the noise more than healthy ones.
+        Warmth is essential. Acknowledge friction ("I know that
+        change wasn't easy"), then offer specific help. Avoid
+        anything that reads as templated.
+      guardrails: |
+        Never promise a roadmap commitment, a discount, or a
+        contract change without CSM/Manager review. Never quote
+        a competitor by name in the draft.
+
+    narration: |
+      Routing follows the three mutually-exclusive edges below, both
+      driven by your own deterministic prompt rules:
+        - urgency == "immediate" AND ARR > $250K → set recipient_role
+          "exec_sponsor", which routes the draft to senior_csm_human
+          for a senior review.
+        - the EXEC-SIGNATURE RULE (ARR >= $500K AND immediate) sets
+          requires_executive_signature, which routes to vp_cs_human —
+          VP CS may add a personal note before sending.
+      Everything else goes to the standard csm_human.
+
+    can_call:
+      # Standard CSM for standard accounts
+      - agent: "csm_human"
+        condition: "calling_agent_response.requires_executive_signature == false and calling_agent_response.recipient_role != 'exec_sponsor'"
+
+      # Senior CSM for exec-routed plays
+      - agent: "senior_csm_human"
+        condition: "calling_agent_response.recipient_role == 'exec_sponsor' and calling_agent_response.requires_executive_signature == false"
+
+      # VP CS gets the strategic plays
+      - agent: "vp_cs_human"
+        condition: "calling_agent_response.requires_executive_signature == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # qbr_drafter_agent — pure-YAML LLM, drafts the quarterly
+  # business review. The data-honesty floor that used to live in
+  # agency/qbr_drafter_agent.py is now an explicit prompt rule.
+  # ────────────────────────────────────────────────────────────
+  qbr_drafter_agent:
+    name: "qbr_drafter_agent"
+    agent_type: "llm"
+    description: "Drafts a QBR deck/document with usage data, ROI achieved, roadmap, asks"
+    model: "claude-sonnet-4-6"             # higher-quality writing for executive doc
+    temperature: 0.2
+    max_completion_tokens: 4000
+    communication_type: "chain"
+    thinking: true
+    thinking_budget: 8192
+    reasoning: true
+
+    prompt: |
+      Draft the customer's quarterly business review document. This
+      goes to their executive sponsor and our internal team. Sections:
+        - Executive summary (3-5 sentences)
+        - Usage snapshot (specific numbers: DAU, feature adoption,
+          API calls, etc.) — pull from the usage knowledge group
+        - ROI / outcomes delivered this quarter (specific to their
+          stated success metrics)
+        - Roadmap items relevant to them
+        - Open feedback + risks (be honest)
+        - Recommended next steps + asks (training, expansion, etc.)
+
+      Tone: peer-to-peer professional, NOT salesy. The exec sponsor
+      should feel respected, not sold to. Cite usage data accurately
+      — making numbers up here destroys QBR credibility.
+
+      DATA-HONESTY FLOOR — apply exactly: missing usage data is
+      BETTER than fabricated data. If you have no real usage numbers,
+      leave usage_snapshot empty ({}) AND add an explicit item to
+      open_feedback: "Detailed usage snapshot is pending — will share
+      by end of week." Never invent a number to fill the section.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"executive_summary": "", "usage_snapshot": {}, "roi_delivered": [], "roadmap_items": [], "open_feedback": [], "recommended_next_steps": []}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "qbr_template"
+
+    yields:
+      executive_summary: "string"
+      usage_snapshot: "object"
+      roi_delivered: "list"
+      roadmap_items: "list"
+      open_feedback: "list"
+      recommended_next_steps: "list"
+
+    inputs:
+      upstream_yields: "object"
+
+    context_parts:
+      guardrails: |
+        Never invent usage numbers. If the data is missing, say so
+        explicitly: "Q3 detailed usage breakdown is pending — will
+        share by [date]." Don't bury risks — surface them.
+
+    can_call:
+      # QBR always reviewed by the assigned CSM tier
+      - agent: "csm_human"
+        condition: "true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # renewals_agent — self-reliant LLM, owns the whole renewal motion.
+  # 2.3.x consolidation: absorbed the renewal-window monitor.
+  # agency/renewals_agent.py gives it hands:
+  #   @pre_compose load_renewal_context — pulls the ARR + renewal_date
+  #     record (forecast runs), OR the real set of accounts entering the
+  #     30/60/90d window from the store (cron window-scan runs).
+  #   @chain enforce_renewal_gates — DETERMINISTIC: the STRATEGIC
+  #     SAFEGUARD (ARR>=$250K may NEVER be auto_renew → high_touch) and
+  #     the window-scan date gate (scans are forced informational +
+  #     terminal, carrying real in-window accounts — never invented).
+  # ────────────────────────────────────────────────────────────
+  renewals_agent:
+    name: "renewals_agent"
+    agent_type: "llm"
+    description: "Renewals analyst — forecasts renewal probability + expansion potential; daily cron responsibility detects accounts entering the 30/60/90-day renewal window"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1000
+    communication_type: "dual"
+    # Cron decision: kept the absorbed window monitor's daily 09:00
+    # schedule — window detection needs exactly one daily pass and
+    # forecasting itself is event-driven (entry point / play-matrix
+    # edge), so one wake_up carries both responsibilities.
+    wake_up: "0 9 * * *"                 # 09:00 daily window scan
+
+    prompt: |
+      You are the renewals analyst. One role, three
+      responsibilities:
+
+      1. RENEWAL FORECAST — renewal probability (0..1): likelihood
+         this customer renews at current terms. Pull signals: usage
+         trend, health score trajectory, NPS, feature adoption,
+         stakeholder map stability, support drag, billing on-time
+         rate.
+
+      2. EXPANSION SIZING — additional MRR potential (specific
+         products / seats / tier upgrade).
+
+      3. RENEWAL-WINDOW DETECTION (daily cron) — when woken on the
+         schedule with only a trigger and no customer context, scan
+         the subscription data available in context for accounts
+         entering the renewal window.
+
+      Cite the top 3 factors driving your prediction. If confidence
+      < 0.7, route to renewals_manager_human — don't try to fake
+      certainty.
+
+      DETERMINISTIC RULES — apply these exactly, every time:
+        - Clamp renewal_probability and confidence to 0..1;
+          expansion_mrr_cents is a non-negative integer.
+        - recommendation is exactly one of: auto_renew | low_touch |
+          high_touch | save | risk_escalate | window_scan. When the
+          right call isn't obvious, derive it from the probability:
+          probability >= 0.8 AND confidence >= 0.85 → "auto_renew";
+          >= 0.6 → "low_touch"; >= 0.4 → "high_touch"; >= 0.2 →
+          "save"; below 0.2 → "risk_escalate".
+        - STRATEGIC SAFEGUARD: arr_cents >= 25000000 ($250K ARR) may
+          NEVER get "auto_renew" — downgrade it to "high_touch".
+          Too much downside for automation alone.
+        - Echo customer_id AND arr_cents unchanged from upstream (the
+          renewals_manager / AE inboxes declare customer_id as an
+          input; arr_cents drives the strategic-account review edge —
+          default arr_cents 0 only when upstream carries none).
+        - RENEWAL-WINDOW RULE: an account is in-window when its
+          contract_end / renewal_date is within 30, 60 or 90 days of
+          today (count it in the SMALLEST window it fits).
+        - WINDOW-SCAN RUNS (cron wake — a trigger and no customer
+          context): set recommendation "window_scan", confidence 1.0
+          and expansion_mrr_cents 0 so NO forecast edge fires (the
+          scan is informational and terminal); list each in-window
+          account in accounts_entering_window and set
+          windows_triggered to the per-window counts, e.g.
+          {"30d": 1, "60d": 2, "90d": 0}. If no subscription data is
+          in context, return empty window fields — never invent
+          accounts.
+        - FORECAST RUNS: accounts_entering_window is [] and
+          windows_triggered is {"30d": 0, "60d": 0, "90d": 0}.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"renewal_probability": 0, "expansion_mrr_cents": 0, "expansion_products": [], "top_factors": [], "confidence": 0, "recommendation": "", "customer_id": "", "arr_cents": 0, "accounts_entering_window": [], "windows_triggered": {}}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    # knowledge groupName choice: kept renewal_forecast_model (from
+    # the absorbed forecaster) — forecasting is the judgment the LLM
+    # must ground; window detection is a simple date rule stated
+    # explicitly in the prompt.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "renewal_forecast_model"
+
+    yields:
+      renewal_probability: "number"        # 0..1
+      expansion_mrr_cents: "number"
+      expansion_products: "list"
+      top_factors: "list"
+      confidence: "number"
+      recommendation: "string"             # auto_renew | low_touch | high_touch | save | risk_escalate | window_scan
+      # Identity passthrough — renewals_manager / ae inboxes declare customer_id
+      customer_id: "string"
+      arr_cents: "number"                  # carried so the strategic-account edge can route
+      # window-detection responsibility (vacuous on forecast runs)
+      accounts_entering_window: "list"
+      windows_triggered: "object"
+
+    inputs:
+      upstream_yields: "object"
+      trigger: "string"
+
+    can_call:
+      # Window-scan runs terminate quietly: the prompt's window-scan
+      # rule yields recommendation='window_scan', confidence=1.0 and
+      # expansion_mrr_cents=0 so none of these edges fires (the
+      # absorbed monitor was terminal).
+      # High confidence + low risk → auto-renew flow (terminates to audit)
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.recommendation == 'auto_renew' and calling_agent_response.confidence >= 0.85"
+
+      # Expansion play → AE gets it (sales handoff)
+      - agent: "ae_human"
+        condition: "calling_agent_response.expansion_mrr_cents > 0"
+
+      # Save / risk path → senior_csm + renewals_manager in parallel
+      - agent: "senior_csm_human"
+        condition: "calling_agent_response.recommendation == 'save' or calling_agent_response.recommendation == 'risk_escalate'"
+
+      # Low confidence, explicit risk escalation, OR any strategic
+      # account (ARR >= $250K) → renewals_manager review. The arr_cents
+      # clause backs the strategic-account narration below; window-scan
+      # runs carry arr_cents 0 so they never trip it.
+      - agent: "renewals_manager_human"
+        condition: "calling_agent_response.confidence < 0.7 or calling_agent_response.recommendation == 'risk_escalate' or calling_agent_response.arr_cents >= 25000000"
+
+    narration: |
+      Strategic accounts (ARR > $250K) ALWAYS get renewals_manager
+      review regardless of confidence — too much downside for
+      automation alone (the arr_cents >= 25000000 clause on the
+      renewals_manager edge enforces this). Daily window scans are
+      informational (arr_cents 0) — the per-account forecasts they
+      spawn carry the actual judgment.
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # csm_human — Tier-1 CSM (standard accounts)
+  # ────────────────────────────────────────────────────────────
+  csm_human:
+    name: "csm_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Customer Success Manager — standard accounts, day-to-day"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400         # 4 hours — CSMs aren't always at the inbox
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_senior"
+      message: "escalate_to_senior"
+      note: "Standard CSM didn't respond within window — escalating to senior CSM"
+
+    yields:
+      decision: "string"                 # approve | send | book | hold | escalate_to_senior
+      notes: "string"
+      sent_at_utc: "string"
+
+    inputs:
+      customer_id: "string"
+      draft: "string"
+
+    human_prompt_template: |
+      Draft for your review — NOT auto-sent. Please:
+        - Edit for personalisation specific to this customer
+        - Confirm tone matches the relationship
+        - Add anything you've heard from the customer recently
+        - Reply 'approve'/'send' to SEND the save-message, 'book' to BOOK
+          the QBR (the play_runner executor runs it), 'hold' to drop, or
+          'escalate_to_senior' for strategic accounts
+
+    can_call:
+      - agent: "senior_csm_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_senior'"
+
+      # Human approved → the play_runner EXECUTOR runs the play (send / book).
+      - agent: "play_runner_agent"
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
+
+      # Anything else (hold / edit / no-approval) → straight to audit.
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_senior' and calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
+
+  # ────────────────────────────────────────────────────────────
+  # senior_csm_human — Tier-2 (named / strategic accounts)
+  # ────────────────────────────────────────────────────────────
+  senior_csm_human:
+    name: "senior_csm_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Senior CSM — named accounts, strategic relationships, exec-sponsor plays"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 28800         # 8 hours (named accounts deserve more time)
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_vp_cs"
+      message: "escalate_to_vp_cs"
+      note: "Senior CSM didn't respond — escalating to VP CS for board-visibility account"
+
+    yields:
+      decision: "string"
+      notes: "string"
+      sent_at_utc: "string"
+
+    inputs:
+      customer_id: "string"
+      draft: "string"
+
+    human_prompt_template: |
+      Strategic / named account. Take your time to get it right —
+      a wrong tone here hurts the relationship more than a delay.
+      Reply 'approve'/'send' to SEND, 'book' to BOOK the QBR (play_runner
+      executes), 'hold' to drop, or 'escalate_to_vp_cs'.
+
+    can_call:
+      - agent: "vp_cs_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_vp_cs'"
+
+      # Senior approved → the play_runner EXECUTOR runs the play.
+      - agent: "play_runner_agent"
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
+
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_vp_cs' and calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
+
+  # ────────────────────────────────────────────────────────────
+  # renewals_manager_human — Tier-2.5 (renewal window owner)
+  # ────────────────────────────────────────────────────────────
+  renewals_manager_human:
+    name: "renewals_manager_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Renewals manager — owns the renewal window, negotiates terms"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 21600         # 6 hours
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_vp_cs"
+      message: "escalate_to_vp_cs"
+      note: "Renewals manager didn't respond — VP CS escalation"
+
+    yields:
+      decision: "string"                 # forecast_approved | renegotiate | escalate_to_vp_cs
+      notes: "string"
+
+    inputs:
+      customer_id: "string"
+      renewal_probability: "number"
+      top_factors: "list"
+
+    can_call:
+      - agent: "vp_cs_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_vp_cs'"
+
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_vp_cs'"
+
+  # ────────────────────────────────────────────────────────────
+  # ae_human — Account Executive (expansion deals only)
+  # ────────────────────────────────────────────────────────────
+  ae_human:
+    name: "ae_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Account Executive — owns expansion deals + competitor responses"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400         # 4 hours
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "hold_for_review"
+      message: "hold_for_review"
+      note: "AE didn't respond — expansion play paused for manual review"
+
+    yields:
+      decision: "string"
+      notes: "string"
+
+    inputs:
+      customer_id: "string"
+      expansion_mrr_cents: "number"
+      expansion_products: "list"
+
+    can_call:
+      - agent: "cs_audit_logger_agent"
+
+  # ────────────────────────────────────────────────────────────
+  # vp_cs_human — Tier-3 (strategic / board-visibility / escalation)
+  # ────────────────────────────────────────────────────────────
+  vp_cs_human:
+    name: "vp_cs_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "VP Customer Success — board-visibility accounts, escalation"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 43200         # 12 hours
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "VP CS unavailable — strategic account paused for personal review (default-deny)"
+
+    yields:
+      decision: "string"
+      directive: "string"
+
+    inputs:
+      customer_id: "string"
+      escalation_reason: "string"
+
+    can_call:
+      # VP approved the strategic play (often after adding a personal
+      # note) → the play_runner EXECUTOR sends it.
+      - agent: "play_runner_agent"
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
+
+      - agent: "cs_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
+
+  # ────────────────────────────────────────────────────────────
+  # cs_audit_logger_agent — hash-chained WORM audit
+  # ────────────────────────────────────────────────────────────
+  cs_audit_logger_agent:
+    name: "cs_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM audit sink for every CS decision and customer touch"
+    framework: "custom"
+    communication_type: "execute"
+
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/cs_audit.jsonl"
+
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+
+    inputs:
+      session_id: "string"
+      payload: "object"
+
+    can_call: []                          # terminal
+
+  # ────────────────────────────────────────────────────────────
+  # play_runner_agent — the EXECUTOR. The rest of the team drafts +
+  # routes; this is the one set of hands that FINISHES the job: after a
+  # human approves the play, it RUNS it — SENDS the approved save-message
+  # via the comms connector (${CS_COMMS_WEBHOOK_URL:}) or BOOKS the QBR
+  # via the calendar connector (${CALENDAR_WEBHOOK_URL:}), choosing
+  # send-vs-book from the play type. Both connectors are INERT until set;
+  # the dev-store fallback RECORDS the sent message / booked meeting so
+  # the play produces a real artifact day-0. agency/play_runner_agent.py:
+  #   @pre_compose load_run_context — resolve send vs book, read the
+  #     human approval signal, pull executions-in-24h for the cap.
+  #   @chain enforce_approval_and_cap — FAIL-CLOSED floor: NEVER run a
+  #     play that wasn't human-approved; NEVER exceed the per-account
+  #     daily frequency cap. Drops any artifact when blocked.
+  # The mesh boundary holds: it talks to a comms / calendar SYSTEM
+  # (egress), never to the customer.
+  # ────────────────────────────────────────────────────────────
+  play_runner_agent:
+    name: "play_runner_agent"
+    agent_type: "programmatic"
+    description: "Executes the human-approved retention play — SENDS the save-message via comms or BOOKS the QBR via calendar — and returns the artifact (message / meeting id)"
+    communication_type: "chain"
+
+    yields:
+      executed: "boolean"
+      action: "string"                    # send | book
+      artifact_type: "string"             # sent_message | booked_meeting
+      artifact_id: "string"               # the message id / meeting id
+      channel: "string"
+      slot: "string"
+      customer_id: "string"
+      blocked: "boolean"                  # true when fail-closed floor refused
+      block_reason: "string"
+      summary: "string"
+      source: "string"                    # comms_connector | calendar_connector | dev_store
+
+    inputs:
+      upstream_yields: "object"
+      customer_id: "string"
+      draft: "string"
+      play_type: "string"
+
+    # Executed (or fail-closed-blocked) → audit terminus, always.
+    can_call:
+      - agent: "cs_audit_logger_agent"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # cs_operations_agent — connector-YAML CS operations.
+  # Product telemetry (DAU, feature breadth, quiet runs) lives in
+  # YOUR analytics stack — Pendo / Amplitude / Segment — not in a
+  # template database. This agent is pure YAML: an n8n workflow
+  # queries your analytics warehouse and returns JSON in the
+  # declared yields shape below. No Python module.
+  # 2.3.x consolidation: one operations role, two responsibilities
+  # (sweep + per-account analytics), mode-dispatched by the workflow.
+  # ────────────────────────────────────────────────────────────
+  cs_operations_agent:
+    name: "cs_operations_agent"
+    agent_type: "programmatic"
+    description: "CS operations — sweeps the whole base (mode=sweep) and pulls DAU trends, feature breadth, quiet runs for one account (mode=analytics) from your Pendo / Amplitude / Segment stack via n8n"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # n8n workflow against YOUR product-analytics stack (Pendo,
+      # Amplitude, Segment, or your warehouse). mode=sweep walks the
+      # active base; mode=analytics computes one account's metrics.
+      # The workflow must respond with JSON in the yields shape below.
+      webhook_url: "${N8N_CS_OPERATIONS_WEBHOOK_URL:}"
+    # Cron decision: the absorbed sweep's 6-hourly schedule is kept
+    # but shipped disabled — a cron firing against an unwired webhook
+    # only produces noise.
+    # wake_up: "0 */6 * * *"   # enable after wiring your Pendo/Amplitude/Segment connector
+
+    yields:
+      # Returned by your analytics workflow (lenient-filled when absent)
+      mode: "string"                      # sweep | analytics
+      # sweep responsibility (vacuous on analytics runs)
+      accounts_swept: "number"
+      accounts_flagged: "number"
+      sweep_at_utc: "string"
+      # analytics responsibility (vacuous on sweep runs)
+      customer_id: "string"
+      dau_7d_avg: "number"
+      dau_28d_avg: "number"
+      dau_delta_pct: "number"
+      feature_breadth: "number"
+      longest_quiet_run_days: "number"
+      analytics_briefing: "string"
+
+    inputs:
+      mode: "string"
+      trigger: "string"
+      customer_event: "object"
+      customer_id: "string"
+
+    narration: |
+      Two modes:
+        sweep (cron / scheduled_health_sweep) → the n8n workflow
+          sweeps the whole base in your analytics stack and reports
+          counts; terminal here.
+        analytics (usage_metrics_pull / peer call with customer_id)
+          → the workflow computes the account's telemetry metrics
+          and this agent feeds them into health_score as a clean
+          deterministic signal.
+
+    can_call:
+      # Feed the analytics summary into health_score for a real
+      # signal — mode-gated so the 6-hourly sweep (customer_id="")
+      # never mis-fires this edge.
+      - agent: "health_score_agent"
+        condition: "calling_agent_response.mode == 'analytics' and calling_agent_response.customer_id != ''"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # customer_onboarding_agent — connector-YAML post-sale adoption
+  # journey. Onboarding state (milestones, TTFV, adoption depth)
+  # lives in YOUR CRM / CS platform — Salesforce / Gainsight — not
+  # in a template database. This agent is pure YAML: an n8n
+  # workflow reads/writes your CRM and returns JSON in the declared
+  # yields shape below. No Python module.
+  # ────────────────────────────────────────────────────────────
+  customer_onboarding_agent:
+    name: "customer_onboarding_agent"
+    agent_type: "programmatic"
+    description: "Post-sale onboarding milestone tracker + TTFV measurement against your Salesforce / Gainsight CS platform via n8n"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # n8n workflow against YOUR CRM / CS platform (Salesforce,
+      # Gainsight). mode=register_close seeds milestones at deal
+      # close; mode=milestone_complete marks one done; mode=sweep
+      # flags overdue milestones + adoption-lagging accounts.
+      # The workflow must respond with JSON in the yields shape below.
+      webhook_url: "${N8N_CUSTOMER_ONBOARDING_WEBHOOK_URL:}"
+    # wake_up: "0 9 * * *"   # enable after wiring your Salesforce/Gainsight connector
+
+    yields:
+      # Returned by your CRM workflow (lenient-filled when absent)
+      action: "string"                 # register_close | milestone_complete | sweep
+      account_id: "string"
+      tier: "string"
+      ttfv_target_days: "number"
+      milestones_seeded: "number"
+      milestone: "string"
+      updated: "boolean"
+      marked_complete_at_utc: "string"
+      swept_at_utc: "string"
+      overdue_milestones_count: "number"
+      overdue_accounts: "list"
+      adoption_lagging_accounts: "list"
+      adoption_lagging_count: "number"
+      requires_playbook_trigger: "boolean"
+      requires_stakeholder_map: "boolean"
+
+    inputs:
+      mode: "string"
+      upstream_yields: "object"
+      account_id: "string"
+      milestone: "string"
+
+    narration: |
+      Three modes:
+        register_close → seed milestones at deal close (called by CRM ingest)
+        milestone_complete → mark a milestone done (called on event)
+        sweep → daily; flag overdue milestones + adoption-lagging accounts
+
+      Milestones (offsets from close): kickoff(0), env_setup(5),
+      data_loaded(10), first_workflow_run(20),
+      first_business_result(40), exec_readout(60).
+
+      TTFV benchmarks: enterprise 60d, mid 30d, smb 14d.
+
+    can_call:
+      # Overdue / lagging accounts need a play — risk_detector names
+      # the pattern and its play-matrix edges pick the play (the
+      # former playbook_trigger_agent route).
+      - agent: "risk_detector_agent"
+        condition: "calling_agent_response.requires_playbook_trigger == true"
+
+      - agent: "account_intel_agent"
+        condition: "calling_agent_response.requires_stakeholder_map == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # competitor_intel_agent — connector-YAML defensive competitor
+  # watch. Competitor profiles, mention ledgers and displacement
+  # scores live in YOUR market-intel tooling — Klue / Crayon — not
+  # in a template database. This agent is pure YAML: an n8n
+  # workflow records mentions / computes account risk in your intel
+  # platform and returns JSON in the declared yields shape below.
+  # No Python module.
+  # ────────────────────────────────────────────────────────────
+  competitor_intel_agent:
+    name: "competitor_intel_agent"
+    agent_type: "programmatic"
+    description: "Records competitor mentions from CSM/support/G2/sales-loss and computes account-level displacement risk in your Klue / Crayon intel platform via n8n"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # n8n workflow against YOUR market-intel tooling (Klue, Crayon,
+      # or your CRM's competitor objects). mode=record stores a
+      # mention with channel-weighted severity; mode=account_risk
+      # aggregates 180 days of signals into a displacement score.
+      # The workflow must respond with JSON in the yields shape below.
+      webhook_url: "${N8N_COMPETITOR_INTEL_WEBHOOK_URL:}"
+
+    yields:
+      # Returned by your intel workflow (lenient-filled when absent)
+      action: "string"                  # record | account_risk
+      signal_id: "string"
+      account_id: "string"
+      competitor: "string"
+      competitor_profile: "object"
+      source_channel: "string"
+      severity: "number"
+      requires_csm_alert: "boolean"
+      requires_save_play: "boolean"
+      requires_stakeholder_map: "boolean"
+      signal_count: "number"
+      displacement_risk_score: "number"
+      primary_threat: "string"
+      competitors_seen: "object"
+      recent_excerpts: "list"
+      recorded_at_utc: "string"
+
+    inputs:
+      mode: "string"                    # record | account_risk
+      upstream_yields: "object"
+      competitor: "string"
+      source_channel: "string"          # g2_review | support_ticket | csm_call_notes | sales_loss | internal
+      excerpt: "string"
+      account_id: "string"
+
+    can_call:
+      - agent: "save_play_agent"
+        condition: "calling_agent_response.requires_save_play == true"
+
+      - agent: "account_intel_agent"
+        condition: "calling_agent_response.requires_stakeholder_map == true"
+
+      - agent: "risk_detector_agent"
+        condition: "calling_agent_response.requires_csm_alert == true and calling_agent_response.requires_save_play == false"
+
+    auto_store_response: true
+    auto_store_yields: true

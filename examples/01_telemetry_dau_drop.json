@@ -1,0 +1,21 @@
+{
+  "_entry_point": "product_telemetry",
+  "_description": "Mid-market SaaS account \u2014 DAU dropped 35% week-over-week. Triggers health_score \u2192 risk_detector (play matrix on its edges) \u2192 CSM save-play.",
+  "customer_event": {
+    "customer_id": "cust-bytewing-021",
+    "signal_source": "telemetry",
+    "arr_cents": 8400000,
+    "segment": "mid_market",
+    "tier": "growth",
+    "raw_payload": {
+      "dau_7d": 142,
+      "dau_baseline": 218,
+      "dau_delta_7d": -0.349,
+      "feature_abandonment": [
+        "analytics_dashboard",
+        "api_explorer"
+      ],
+      "login_frequency_30d": 6
+    }
+  }
+}

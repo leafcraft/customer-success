@@ -1,0 +1,26 @@
+{
+  "_entry_point": "exec_change",
+  "_description": "CRM detected the champion left \u2014 account_intel (stakeholder mode) is the entry point, stakeholder map gets rebuilt.",
+  "customer_event": {
+    "customer_id": "cust-pacific-shipping-014",
+    "signal_source": "crm",
+    "arr_cents": 5600000,
+    "segment": "smb",
+    "tier": "standard",
+    "raw_payload": {
+      "event_type": "champion_left",
+      "former_champion": {
+        "email": "j.morales@pacshipping.example",
+        "role": "VP Operations",
+        "exit_date": "2026-05-28"
+      },
+      "new_contacts": [
+        {
+          "email": "k.singh@pacshipping.example",
+          "role": "Director Logistics"
+        }
+      ],
+      "authority_gap_score": 0.7
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "_entry_point": "billing_event",
+  "_description": "Failed credit card payment on a renewal \u2014 risk_detector picks it up, account_intel (stakeholder mode) confirms champion is still there, save_play drafts a CSM outreach.",
+  "customer_event": {
+    "customer_id": "cust-orbital-systems-008",
+    "signal_source": "billing",
+    "arr_cents": 14200000,
+    "segment": "enterprise",
+    "tier": "enterprise",
+    "raw_payload": {
+      "event_type": "renewal_charge_failed",
+      "amount_cents": 1183333,
+      "card_last4": "4242",
+      "failure_code": "card_declined",
+      "retry_attempt": 2,
+      "renewal_date": "2026-06-15"
+    }
+  }
+}
