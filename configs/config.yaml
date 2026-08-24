@@ -45,18 +45,27 @@
 #   4. HITL gates on every customer-facing action — save-play
 #      drafts go to the CSM; QBR drafts get reviewed; renewal
 #      forecasts confirm with the renewals manager.
-#   5. KNOWLEDGE-GROUNDED — health-score rules, save-play library,
-#      QBR template, segment definitions all live in the customer's
-#      knowledge base. Updates propagate instantly.
+#   5. PLAYBOOK-GROUNDED — health-score rules, the save-play craft,
+#      the QBR template and the risk taxonomy ship as per-agent
+#      `playbook:` blocks (only the `description` rides in the prompt;
+#      the `responsibility` loads on demand — gotcha #15). The pod runs
+#      day-0 with NO knowledge backend; swap in a hosted `knowledge:`
+#      group later without touching the wiring.
 #   6. Bidirectional collaboration — risk_detector can call
 #      account_intel_agent for stakeholder context; QBR drafter
 #      can call cs_operations for fresh usage data; save_play can
 #      call renewals_agent for context.
-#   7. CRON CITIZENS — the renewals_agent daily window detection
-#      runs in parallel to the per-event flow (the cs_operations
-#      and onboarding sweeps wake up once their n8n connectors to
-#      your analytics / CRM stack are wired).
-#   8. Event-bus subscribers — every escalation, intervention,
+#   7. CRON CITIZENS + FAN-OUT — renewals_agent runs the daily window
+#      detection; account_sweep_agent runs the base-wide health sweep
+#      FANNED OUT over `instances: 3` (each copy atomically claims a
+#      disjoint account batch). Both crons declare a `timezone` so they
+#      fire in business time, not UTC (gotcha #13). The cs_operations /
+#      onboarding sweeps wake once their n8n connectors are wired.
+#   8. MODERN CAPABILITIES — memory (cross-session health on
+#      health_score), super_agent (the save-play drafter), per-intent
+#      playbooks, instances fan-out, and a commented CRM mcp block with
+#      day-0 dev-store tools (agency/tools.py) behind it.
+#   9. Event-bus subscribers — every escalation, intervention, and
 #      save-play sent is audited out-of-band for QBR reporting.
 
 name: "customer-success"
@@ -69,15 +78,17 @@ log_level: "INFO"
 # ═══════════════════════════════════════════════════════════════════
 # REDIS — health-score cache, customer context, save-play history
 # ═══════════════════════════════════════════════════════════════════
-redis:
-  host: "${REDIS_HOST:localhost}"
-  port: ${REDIS_PORT:6379}
-  db: 0
-  password: "${REDIS_PASSWORD:}"
-  auto_storage: true
-  decode_responses: true
-  default_ttl: 86400              # keep customer state for a day across signals
-  session_ttl: 604800             # 7 days — long enough for save-play follow-through
+persistence:
+  backend: redis
+  redis:
+    host: "${REDIS_HOST:localhost}"
+    port: ${REDIS_PORT:6379}
+    db: 0
+    password: "${REDIS_PASSWORD:}"
+    auto_storage: true
+    decode_responses: true
+    default_ttl: 86400              # keep customer state for a day across signals
+    session_ttl: 604800             # 7 days — long enough for save-play follow-through
 
 # ═══════════════════════════════════════════════════════════════════
 # AUTO-DISCOVER
@@ -91,7 +102,6 @@ auto_discover:
 # MANAGER — supervisor, watches for save-play patterns + escalations
 # ═══════════════════════════════════════════════════════════════════
 manager:
-  enabled: true
   model: "gpt-4o-mini"
   domain: "generic"
   can_intervene: true
@@ -128,12 +138,12 @@ manager:
     fallback: "all"
     decay_days: 60
 
-  # Manager-level knowledge — Summarizer reads the CS playbook + segmentation
-  # rules + executive engagement protocol on every analysis turn
-  knowledge:
-    serviceName: "mongo_main"
-    enabled: true
-    groupName: "cs_playbook"
+  # NOTE: the CS playbook / segmentation rules / exec-engagement protocol are
+  # now shipped as per-agent `playbook:` blocks (the craft loaded on demand,
+  # gotcha #15) instead of a mongo `knowledge:` group — so the pod runs day-0
+  # with NO knowledge backend. To ground the Manager's Summarizer in a hosted
+  # SOP instead, add a `knowledge: {serviceName, enabled, groupName}` block here
+  # and install `leafmesh[knowledge]`.
 
   escalation:
     targets:
@@ -226,8 +236,8 @@ entry_points:
     description: "Telemetry: engagement drop > 30% week-over-week — risk re-evaluation"
 
   - name: "scheduled_health_sweep"
-    target: "cs_operations_agent"
-    description: "Proactive sweep across the whole base (mode=sweep) — catches the slow decline"
+    target: "account_sweep_agent"
+    description: "Proactive sweep across the whole base — instances fan out over the account backlog (day-0, no connector)"
 
   - name: "qbr_due"
     target: "qbr_drafter_agent"
@@ -418,10 +428,45 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 2
 
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "health_rules"
+    # MEMORY (cross-session health) — health is a trajectory, not a snapshot.
+    # `memory: true` gives this agent a recall_memory tool + auto-injected
+    # recent feed, so a score reads against THIS account's prior scores across
+    # sessions — catching the slow multi-week decline a single event misses.
+    memory: true
+    memory_limit: 20
+    memory_strategy: "both"              # inject recent feed + expose recall_memory tool
+
+    # DEV-STORE TOOLS — on-demand deep reads the @pre_compose baseline doesn't
+    # pull. Each ANNOUNCES ITSELF (available:false) when the account is unknown
+    # or no real source is wired. See agency/tools.py; PROD swaps the store body.
+    tools: [get_account_detail, list_executed_plays]
+    tool_categories: [cs_context]
+
+    # PLAYBOOK — the scoring + explanation CRAFT, fetched on demand (only the
+    # `description` rides in the prompt; `responsibility` loads when the model
+    # recognises the job). Replaces the mongo `health_rules` knowledge group.
+    playbook:
+      - intent: health_scoring
+        description: "How to weight usage / support / billing / engagement into a defensible 0-100 score."
+        responsibility: |
+          1. Aggregate the rolling 30-day signal window, never a single event.
+             Weight by signal_source: telemetry → engagement; billing →
+             commercial (downgrade, failed payment); support → volume+sentiment.
+          2. Score velocity, not just level — score_delta_30d is required; an
+             80 trending -15/30d is more at risk than a flat 65.
+          3. Thin history (< 7 signals) → confidence < 0.6 so risk_detector
+             defers to a CSM rather than firing a play on a guess.
+        variables: [customer_id]
+      - intent: score_explanation
+        description: "How to turn a score into a defensible plain-English 'why' a CSM can quote to sales."
+        responsibility: |
+          1. Lead with an executive_summary the CSM can paste verbatim.
+          2. top_3_contributors = the biggest drivers (factor, weight_pct,
+             recent_trend), at most 3.
+          3. if_we_did_nothing = the 30-day forecast with no intervention.
+          4. Honesty over comfort — if you can't explain it, say so; a CSM
+             defending an inaccurate score loses credibility fast.
+        variables: [customer_id]
 
     yields:
       health_score: "number"          # 0..100
@@ -505,7 +550,9 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.1
     max_tokens: 1000
-    communication_type: "dual"             # bidirectional — can call account_intel
+    max_tool_calls_per_message: 12         # context + playbook + peer reads — 5 truncates silently
+    communication_type: "chain"            # AI specialist → chain. dual↔dual auto-bounces replies
+                                           # (gotcha #17); it still calls account_intel via can_call.
 
     prompt: |
       Identify the specific risk PATTERN(S) at play given the health
@@ -558,10 +605,34 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 2
 
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "risk_patterns"
+    # DEV-STORE TOOLS — on-demand deep reads (full account + the executed-play
+    # ledger) beyond the @pre_compose baseline. available:false when unknown.
+    tools: [get_account_detail, list_executed_plays]
+    tool_categories: [cs_context]
+
+    # PLAYBOOK — the risk-pattern taxonomy CRAFT, on demand. Replaces the mongo
+    # `risk_patterns` knowledge group. The pattern string IS the play selector
+    # (the matrix lives on this agent's edges), so accuracy is load-bearing.
+    playbook:
+      - intent: pattern_taxonomy
+        description: "How to name the right churn pattern from the health verdict + recent signal log."
+        responsibility: |
+          Map evidence to EXACTLY one label: usage_decay | feature_abandonment
+          | support_drag | billing_friction | exec_turnover |
+          silent_disengagement | product_misfit | competitor_in_account |
+          approaching_renewal. Drop any candidate that doesn't fit — an
+          invented name routes to hold/audit. primary_pattern = the highest
+          severity; "" with primary_severity 0 when nothing valid fits.
+        variables: [customer_id]
+      - intent: intervention_urgency
+        description: "How urgent the play the matrix fires should be, from the CS playbook."
+        responsibility: |
+          billing_friction / exec_turnover / competitor_in_account → immediate.
+          silent_disengagement / support_drag / high-severity usage_decay →
+          this_week. feature_abandonment / product_misfit / moderate
+          usage_decay → this_month. Strategic accounts (ARR > $250K) uplift
+          this_month → this_week.
+        variables: [customer_id, primary_pattern]
 
     yields:
       patterns: "list"                     # list of {pattern, severity, evidence}
@@ -712,7 +783,8 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.1
     max_tokens: 1200
-    communication_type: "dual"
+    max_tool_calls_per_message: 12         # context + playbook + peer reads — 5 truncates silently
+    communication_type: "chain"            # AI specialist → chain (dual↔dual is a footgun, gotcha #17)
 
     prompt: |
       You are the account intelligence analyst. One role, two
@@ -799,14 +871,46 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 2
 
-    # knowledge groupName choice: kept stakeholder_protocol (from
-    # the absorbed stakeholder mapper) — the two-signal confirmation
-    # protocol is the judgment the LLM must ground; the expansion
-    # floor thresholds are explicit deterministic prompt rules.
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "stakeholder_protocol"
+    # DEV-STORE TOOLS — the account record (stakeholders + usage) beyond the
+    # mode-specific @pre_compose slice. available:false when unknown.
+    tools: [get_account_detail, list_executed_plays]
+    tool_categories: [cs_context]
+
+    # ── REAL CRM / CS-platform connector (day-N). Each named action under
+    #    `use:` becomes its own namespaced tool (e.g. crm_get_contacts). The SDK
+    #    REJECTS an http mcp block with an EMPTY url at load, so this ships
+    #    COMMENTED — set CRM_MCP_URL, then uncomment. Until then the dev-store
+    #    tools above are the day-0 fallback contract. (gotcha #12) ──
+    # mcp:
+    #   - transport: http
+    #     url: "${CRM_MCP_URL}"
+    #     token: "${CRM_MCP_TOKEN:}"
+    #     use: [get_contacts, get_opportunities, get_usage]
+    #     name: crm
+    #     timeout: 30
+
+    # PLAYBOOK — the expansion + stakeholder CRAFT, on demand. Replaces the
+    # mongo `stakeholder_protocol` knowledge group.
+    playbook:
+      - intent: stakeholder_alignment
+        description: "How to confirm a champion / exec change and rebuild the stakeholder map without false positives."
+        responsibility: |
+          TWO-SIGNAL RULE: change_confirmed may be true ONLY with an explicit
+          CRM confirmation OR ≥2 independent corroborating signals (LinkedIn +
+          email bounce). A single non-CRM signal NEVER confirms — a false
+          positive triggers outreach that damages trust. Confirmed + no
+          successor → authority_gap true → introduce_successor; confirmed with
+          a successor → re_engage; not confirmed → hold.
+        variables: [customer_id]
+      - intent: expansion_scan
+        description: "How to score upsell / cross-sell from real utilisation, and route it to the AE, not the customer."
+        responsibility: |
+          seat_util ≥ 0.85 → seat_expansion; api_util ≥ 0.80 → tier_upgrade_api;
+          1+ premium feature touched → tier_upgrade_features. expansion_score =
+          min(1.0, 0.25·#upsell + 0.2·#cross_sell); ae_action_required at ≥ 0.5.
+          Expansion is a SALES motion — high scores go to the AE, never straight
+          to customer outreach.
+        variables: [customer_id]
 
     yields:
       intel_mode: "string"                 # expansion | stakeholder
@@ -882,7 +986,9 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.3                   # some creativity for personalization
     max_tokens: 1000
-    communication_type: "dual"          # can call renewals_agent for context
+    max_tool_calls_per_message: 12      # play history + library playbook reads — 5 truncates silently
+    communication_type: "chain"         # AI specialist → chain (dual↔dual is a footgun, gotcha #17);
+                                        # it still calls renewals_agent for context via can_call.
 
     prompt: |
       Draft a save-play outreach for this at-risk customer. The
@@ -939,10 +1045,33 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 1
 
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "save_play_library"
+    # SUPER-AGENT (save plays) — drafting the right save is a plan → execute →
+    # verify → reflect job (pull history, pick the angle, personalise, self-
+    # check tone/asks), so this specialist is wrapped in the orchestrator.
+    # DICT form is the ONLY tuning path (2.4.131); NEVER flat super_agent_* keys.
+    super_agent:
+      cost_ceiling: 100000              # aggregate token budget for one draft run
+      wall_clock: 900                   # per-run wall-clock seconds
+
+    # DEV-STORE TOOLS — prior plays + the executed-play ledger so the draft
+    # knows what's already been tried. available:false when unknown.
+    tools: [get_account_detail, list_executed_plays]
+    tool_categories: [cs_context]
+
+    # PLAYBOOK — the save-play CRAFT, on demand. Replaces the mongo
+    # `save_play_library` knowledge group.
+    playbook:
+      - intent: save_play_craft
+        description: "How to draft a save that reads personal, not templated, for a specific churn pattern."
+        responsibility: |
+          Personalise to the pattern (usage_decay vs billing vs exec_turnover),
+          the tier + ARR, and the last 30 days of activity. Cite a specific
+          signal ("logins down 40% since the March API change"), not a greeting.
+          Offer 2-3 alternative angles + a clear ask + a backup. Never promise a
+          roadmap commitment, discount, or contract change; never name a
+          competitor. The draft is REVIEWED by a CSM — give them a strong start,
+          not something to ship.
+        variables: [customer_id]
 
     yields:
       primary_draft: "string"
@@ -1043,10 +1172,26 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 2
 
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "qbr_template"
+    # DEV-STORE TOOLS — the account's real usage snapshot for the QBR numbers.
+    # available:false when unknown — the data-honesty floor turns that into an
+    # explicit "usage snapshot pending" line, never an invented number.
+    tools: [get_account_detail]
+    tool_categories: [cs_context]
+    max_tool_calls_per_message: 10
+
+    # PLAYBOOK — the QBR CRAFT, on demand. Replaces the mongo `qbr_template`
+    # knowledge group.
+    playbook:
+      - intent: qbr_authoring
+        description: "How to structure a peer-to-peer (not salesy) QBR the exec sponsor respects."
+        responsibility: |
+          Sections: exec summary; usage snapshot (real numbers only); ROI /
+          outcomes vs their stated success metrics; roadmap items relevant to
+          THEM; open feedback + risks (don't bury them); recommended next steps.
+          DATA-HONESTY FLOOR: missing usage data beats fabricated data — leave
+          usage_snapshot {} and add "usage snapshot pending — will share by
+          [date]" to open_feedback rather than inventing a figure.
+        variables: [customer_id]
 
     yields:
       executive_summary: "string"
@@ -1092,12 +1237,16 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.0
     max_tokens: 1000
-    communication_type: "dual"
+    max_tool_calls_per_message: 12       # renewal record + forecast-model playbook reads
+    communication_type: "chain"          # AI specialist → chain (dual↔dual is a footgun, gotcha #17);
+                                         # it still calls account_intel/renewals peers via can_call.
     # Cron decision: kept the absorbed window monitor's daily 09:00
     # schedule — window detection needs exactly one daily pass and
     # forecasting itself is event-driven (entry point / play-matrix
     # edge), so one wake_up carries both responsibilities.
     wake_up: "0 9 * * *"                 # 09:00 daily window scan
+    timezone: "Asia/Kolkata"             # gotcha #13 — without this the cron fires at 09:00 UTC,
+                                         # not 09:00 local. Set to YOUR business timezone (IANA name).
 
     prompt: |
       You are the renewals analyst. One role, three
@@ -1159,14 +1308,26 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 2
 
-    # knowledge groupName choice: kept renewal_forecast_model (from
-    # the absorbed forecaster) — forecasting is the judgment the LLM
-    # must ground; window detection is a simple date rule stated
-    # explicitly in the prompt.
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "renewal_forecast_model"
+    # DEV-STORE TOOLS — the renewal record + executed-play ledger for the
+    # forecast. available:false when unknown.
+    tools: [get_account_detail, list_executed_plays]
+    tool_categories: [cs_context]
+
+    # PLAYBOOK — the forecasting CRAFT, on demand. Replaces the mongo
+    # `renewal_forecast_model` knowledge group. Window detection is a date rule
+    # stated in the prompt + enforced in the @chain.
+    playbook:
+      - intent: renewal_forecast
+        description: "How to forecast renewal probability + size expansion, and when to defer to a human."
+        responsibility: |
+          Pull the signals that predict renewal: usage trend, health-score
+          trajectory, NPS, feature adoption, stakeholder-map stability, support
+          drag, billing on-time rate. Cite the top 3 factors. Derive the
+          recommendation from probability when unclear (≥0.8 & conf ≥0.85 →
+          auto_renew; ≥0.6 low_touch; ≥0.4 high_touch; ≥0.2 save; else
+          risk_escalate). Confidence < 0.7 → route to the renewals manager;
+          never fake certainty.
+        variables: [customer_id]
 
     yields:
       renewal_probability: "number"        # 0..1
@@ -1237,14 +1398,14 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    fallback_on_timeout: true
+    fallback_on_timeout: true            # DEFAULT-DENY: silence never sends a customer message
     fallback_response:
-      decision: "escalate_to_senior"
-      message: "escalate_to_senior"
-      note: "Standard CSM didn't respond within window — escalating to senior CSM"
+      human_decision: "held"
+      human_message: "held_for_review"
+      note: "Standard CSM didn't respond within window — held for review; the Manager SUPERVISOR escalates to senior/VP"
 
     yields:
-      decision: "string"                 # approve | send | book | hold | escalate_to_senior
+      decision: "string"                 # approve | send | book | hold
       notes: "string"
       sent_at_utc: "string"
 
@@ -1258,20 +1419,20 @@ agents:
         - Confirm tone matches the relationship
         - Add anything you've heard from the customer recently
         - Reply 'approve'/'send' to SEND the save-message, 'book' to BOOK
-          the QBR (the play_runner executor runs it), 'hold' to drop, or
-          'escalate_to_senior' for strategic accounts
+          the QBR (the play_runner executor runs it), or 'hold' to drop.
+          Strategic-account escalation is the Manager's job — you don't
+          hand off to the senior CSM here.
 
     can_call:
-      - agent: "senior_csm_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_senior'"
-
       # Human approved → the play_runner EXECUTOR runs the play (send / book).
       - agent: "play_runner_agent"
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
 
-      # Anything else (hold / edit / no-approval) → straight to audit.
+      # Anything else (hold / held_for_review / no-approval) → audit terminus.
+      # Tier escalation is the Manager SUPERVISOR's job (manager.escalation →
+      # vp_cs_human), NEVER a hardcoded human→human wire (dual↔dual, gotcha #17).
       - agent: "cs_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_senior' and calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
+        condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
 
   # ────────────────────────────────────────────────────────────
   # senior_csm_human — Tier-2 (named / strategic accounts)
@@ -1289,11 +1450,11 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    fallback_on_timeout: true
+    fallback_on_timeout: true            # DEFAULT-DENY: silence never sends
     fallback_response:
-      decision: "escalate_to_vp_cs"
-      message: "escalate_to_vp_cs"
-      note: "Senior CSM didn't respond — escalating to VP CS for board-visibility account"
+      human_decision: "held"
+      human_message: "held_for_review"
+      note: "Senior CSM didn't respond — held for review; the Manager SUPERVISOR escalates to VP CS"
 
     yields:
       decision: "string"
@@ -1308,18 +1469,17 @@ agents:
       Strategic / named account. Take your time to get it right —
       a wrong tone here hurts the relationship more than a delay.
       Reply 'approve'/'send' to SEND, 'book' to BOOK the QBR (play_runner
-      executes), 'hold' to drop, or 'escalate_to_vp_cs'.
+      executes), or 'hold' to drop. VP escalation is the Manager's job.
 
     can_call:
-      - agent: "vp_cs_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_vp_cs'"
-
       # Senior approved → the play_runner EXECUTOR runs the play.
       - agent: "play_runner_agent"
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
 
+      # Held / no-approval → audit. VP escalation is the Manager SUPERVISOR's
+      # job (manager.escalation → vp_cs_human), NOT a human→human wire (gotcha #17).
       - agent: "cs_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_vp_cs' and calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
+        condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
 
   # ────────────────────────────────────────────────────────────
   # renewals_manager_human — Tier-2.5 (renewal window owner)
@@ -1337,14 +1497,14 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    fallback_on_timeout: true
+    fallback_on_timeout: true            # DEFAULT-DENY
     fallback_response:
-      decision: "escalate_to_vp_cs"
-      message: "escalate_to_vp_cs"
-      note: "Renewals manager didn't respond — VP CS escalation"
+      human_decision: "held"
+      human_message: "held_for_review"
+      note: "Renewals manager didn't respond — held for review; the Manager SUPERVISOR escalates to VP CS"
 
     yields:
-      decision: "string"                 # forecast_approved | renegotiate | escalate_to_vp_cs
+      decision: "string"                 # forecast_approved | renegotiate | held_for_review
       notes: "string"
 
     inputs:
@@ -1353,11 +1513,9 @@ agents:
       top_factors: "list"
 
     can_call:
-      - agent: "vp_cs_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_vp_cs'"
-
+      # Every renewals-manager decision is recorded; VP escalation is the
+      # Manager SUPERVISOR's job (manager.escalation), not a human→human wire.
       - agent: "cs_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_vp_cs'"
 
   # ────────────────────────────────────────────────────────────
   # ae_human — Account Executive (expansion deals only)
@@ -1375,10 +1533,10 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    fallback_on_timeout: true
+    fallback_on_timeout: true            # DEFAULT-DENY
     fallback_response:
-      decision: "hold_for_review"
-      message: "hold_for_review"
+      human_decision: "held"
+      human_message: "held_for_review"
       note: "AE didn't respond — expansion play paused for manual review"
 
     yields:
@@ -1409,11 +1567,11 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    fallback_on_timeout: true
+    fallback_on_timeout: true            # DEFAULT-DENY — the last line, silence never advances
     fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "VP CS unavailable — strategic account paused for personal review (default-deny)"
+      human_decision: "held"
+      human_message: "held_for_review"
+      note: "VP CS unavailable — strategic account held for personal review (default-deny)"
 
     yields:
       decision: "string"
@@ -1486,6 +1644,7 @@ agents:
       action: "string"                    # send | book
       artifact_type: "string"             # sent_message | booked_meeting
       artifact_id: "string"               # the message id / meeting id
+      artifact_path: "string"             # ./out record of the run (dropped on block)
       channel: "string"
       slot: "string"
       customer_id: "string"
@@ -1501,6 +1660,59 @@ agents:
       play_type: "string"
 
     # Executed (or fail-closed-blocked) → audit terminus, always.
+    can_call:
+      - agent: "cs_audit_logger_agent"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # account_sweep_agent — the PROACTIVE base-wide sweep, FANNED OUT.
+  # instances: 3 → one daily wake fans into 3 parallel copies in the SAME
+  # session; each copy atomically CLAIMS a disjoint batch of accounts from a
+  # shared backlog queue (claim_account_batch — LPOP-style, thread-locked) so
+  # the copies SPLIT the base instead of all scanning it (gotcha: without a
+  # claim tool the copies duplicate work). Under instances_handoff: last the
+  # numeric yields SUM and the list yields CONCATENATE, so the combined result
+  # is the whole-base digest — no ratios here, so no reshape needed. Terminal to
+  # the WORM audit sink (the daily digest CSMs read); per-account deep analysis
+  # is driven by the per-event entry points. agency/account_sweep_agent.py binds
+  # by name (auto_discover) and calls the SAME atomic store primitive the tool
+  # wraps, so it fails closed (empty batch) when the base is exhausted.
+  # ────────────────────────────────────────────────────────────
+  account_sweep_agent:
+    name: "account_sweep_agent"
+    agent_type: "programmatic"
+    description: "Proactive base-wide health sweep — instances fan out over the account backlog and flag at-risk accounts for the daily digest"
+    communication_type: "chain"
+    instances: 3                          # 3 parallel copies per wake
+    instances_handoff: "last"             # COMBINE (sum numbers, concat lists), route once
+    # Daily base sweep. ONE cron line — instances × a multi-entry wake_up list
+    # would multiply runs (gotcha). timezone is REQUIRED or it fires at 07:00 UTC.
+    wake_up: "0 7 * * *"
+    timezone: "Asia/Kolkata"
+    wake_up_input:
+      trigger: "scheduled_health_sweep"
+
+    # The atomic claim is the `claim_account_batch` @global_tool (agency/tools.py,
+    # category: backlog). A PROGRAMMATIC agent cannot declare `tools:` (the SDK
+    # rejects it), so this module calls the SAME thread-locked store primitive
+    # the tool wraps — passing the session id as the run generation so the three
+    # copies split one backlog. The tool is there for an LLM sweep variant.
+
+    yields:
+      accounts_claimed: "number"          # SUMmed across the 3 copies
+      accounts_flagged: "number"          # SUMmed
+      flagged_accounts: "list"            # CONCATenated in instance order
+      window_start_utc: "string"
+      source: "string"                    # dev_store | cs_data_platform
+
+    inputs:
+      trigger: "string"
+      mode: "string"
+
+    # Terminal: the sweep digest is recorded to the WORM sink. In production the
+    # flagged accounts would ALSO be enqueued for per-account risk evaluation.
     can_call:
       - agent: "cs_audit_logger_agent"
 

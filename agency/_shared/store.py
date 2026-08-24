@@ -434,3 +434,56 @@ def _placeholder_slot() -> str:
         hour=10, minute=0, second=0, microsecond=0
     )
     return slot.isoformat()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BACKLOG FAN-OUT QUEUE — the atomic claim the account_sweep_agent's
+# parallel instances use to SPLIT the account base instead of duplicating
+# it. Thread-locked, LPOP-style: each claim atomically removes up to
+# `count` ids. Keyed by `gen` (the sweep's session id) so the copies in
+# ONE wake share a drained queue (a drained gen returns available:false —
+# no re-seed mid-run, so no duplication) while the NEXT day's wake, a new
+# gen, gets a fresh full backlog. PROD: `SELECT ... FOR UPDATE SKIP LOCKED`
+# on your CRM, or a Redis `LPOP key count`.
+# ─────────────────────────────────────────────────────────────────────
+_BACKLOG_LOCK = threading.Lock()
+_BACKLOG: list[str] = []
+_BACKLOG_GEN: str | None = None
+
+
+def reset_backlog() -> None:
+    """Force the next claim to re-seed (dev/test helper)."""
+    global _BACKLOG_GEN
+    with _BACKLOG_LOCK:
+        _BACKLOG.clear()
+        _BACKLOG_GEN = None
+
+
+def claim_account_batch(count: int = 5, gen: str = "") -> dict[str, Any]:
+    """Atomically claim up to `count` account ids from the shared sweep
+    backlog so parallel sweep instances pull DISJOINT batches.
+
+    `gen` scopes a sweep run (pass the session id): a new gen re-seeds the
+    backlog from the account base; the same gen drains it and then returns
+    available:false — never re-seeding mid-run, so copies never duplicate.
+    Returns available:false when the run's backlog is exhausted."""
+    global _BACKLOG_GEN
+    try:
+        n = max(1, int(count))
+    except (TypeError, ValueError):
+        n = 5
+    key = str(gen or "default")
+    with _BACKLOG_LOCK:
+        if key != _BACKLOG_GEN:
+            # New sweep run → fresh full backlog for this generation.
+            _BACKLOG.clear()
+            _BACKLOG.extend(sorted(_accounts().keys()))
+            _BACKLOG_GEN = key
+        if not _BACKLOG:
+            return {"available": False,
+                    "reason": "backlog exhausted for this sweep run — nothing left to claim",
+                    "claimed": [], "count": 0, "remaining": 0}
+        claimed = _BACKLOG[:n]
+        del _BACKLOG[:n]
+        return {"available": True, "claimed": claimed,
+                "count": len(claimed), "remaining": len(_BACKLOG)}

@@ -13,27 +13,30 @@ watch all of them every day, so the mesh does.
 At 02:00, ACME Corp's product telemetry fires a `product_telemetry`
 signal — daily active users down 42% over 30 days. The
 **health_score_agent** pulls ACME's rolling 30-day signal window from
-Redis and the scoring rubric from the `health_rules` knowledge group,
-and returns a score of **58 (at_risk), delta −18, confidence 0.82** —
-plus a plain-English explanation Maya can quote to sales. Because the
-band isn't healthy and ACME isn't a $500K strategic-drop account, it
-hands off to the **risk_detector_agent**.
+the store and, grounded in its `health_scoring` playbook (fetched on
+demand) and its cross-session **memory** of ACME's prior scores, returns
+**58 (at_risk), delta −18, confidence 0.82** — plus a plain-English
+explanation Maya can quote to sales. Because the band isn't healthy and
+ACME isn't a $500K strategic-drop account, it hands off to the
+**risk_detector_agent**.
 
-The risk detector grounds itself in the `risk_patterns` group and names
-the pattern: `usage_decay`, severity 0.7, on a $300K-ARR account. That
-exact cell of the **play matrix** — one conditional edge on the risk
-detector itself — fires the **save_play_agent** (usage_decay, sev ≥ 0.6,
-ARR ≥ $50K → immediate save). Save_play drafts a warm, specific
-outreach from the `save_play_library` ("Hi Sarah — your team's logins
-dropped 40% since the March API change…") with two alternative angles
-and a clear ask. It is **never auto-sent**. Because ACME is $300K and
-the play is urgent, recipient_role is `exec_sponsor`, so the draft
-lands in **senior_csm_human**'s inbox. Maya's senior colleague edits
-the personalisation, approves, and sends. Every hop — the score, the
-pattern, the draft, the human decision — is appended to the
-hash-chained **cs_audit_logger_agent** WORM log. If the senior CSM had
-not responded within 8 hours, the gate would have escalated to VP CS
-(default-deny), never auto-acted.
+The risk detector loads its `pattern_taxonomy` playbook and names the
+pattern: `usage_decay`, severity 0.7, on a $300K-ARR account. That exact
+cell of the **play matrix** — one conditional edge on the risk detector
+itself — fires the **save_play_agent** (usage_decay, sev ≥ 0.6, ARR ≥
+$50K → immediate save). Save_play (a **super_agent** — plan → draft →
+self-check) writes a warm, specific outreach ("Hi Sarah — your team's
+logins dropped 40% since the March API change…") with two alternative
+angles and a clear ask. It is **never auto-sent**. Because ACME is $300K
+and the play is urgent, recipient_role is `exec_sponsor`, so the draft
+lands in **senior_csm_human**'s inbox. Maya's senior colleague edits the
+personalisation, approves, and the **play_runner_agent** finisher sends
+it (fail-closed: it re-checks the approval and the per-account frequency
+cap before any send). Every hop — the score, the pattern, the draft, the
+approval, the send — is appended to the hash-chained
+**cs_audit_logger_agent** WORM log. If the senior CSM had not responded
+within 8 hours, the gate would have **held for review** (default-deny)
+and the Manager supervisor would escalate to VP CS — never auto-acted.
 
 Maya never opened a dashboard. She got one reviewed draft for the one
 account that needed her, with the reasoning attached.
@@ -96,35 +99,45 @@ that returns JSON in the declared `yields` shape.
 | `N8N_CS_OPERATIONS_WEBHOOK_URL` | optional | `cs_operations_agent` → Pendo / Amplitude / Segment |
 | `N8N_CUSTOMER_ONBOARDING_WEBHOOK_URL` | optional | `customer_onboarding_agent` → Salesforce / Gainsight |
 | `N8N_COMPETITOR_INTEL_WEBHOOK_URL` | optional | `competitor_intel_agent` → Klue / Crayon |
+| `CRM_MCP_URL` / `CRM_MCP_TOKEN` | optional | `account_intel_agent`'s commented CRM `mcp:` block → your CRM / CS platform (uncomment the block after setting the URL); until then the `agency/tools.py` dev-store tools serve day-0 |
 
 ## Agent table (the department)
 
 Role = the human job title a VP of Customer Success would recognise.
-Grounded in each agent's actual type, knowledge group, tools and edges
-in `configs/config.yaml`.
+Grounded in each agent's actual type, playbook, tools and edges in
+`configs/config.yaml`. Human tiers no longer hand off to each other
+(a `dual→dual` footgun, gotcha #17): a gate either approves → the
+finisher, or holds → audit, and the **Manager supervisor** owns tier
+escalation (manager.escalation → `vp_cs_human`).
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
-| `health_score_agent` | Customer Health Analyst | Aggregates usage/billing/support/engagement into a 0..100 score + 30d velocity, grounded in `health_rules`; explains the score in plain English; applies band + confidence safety floors | Routes non-healthy bands → `risk_detector_agent`; strategic-drop (ARR ≥ $500K, score fell >10/30d) → `senior_csm_human` directly; healthy + confident → audit |
-| `risk_detector_agent` | Retention Risk Strategist | Names the specific churn pattern (usage_decay, exec_turnover, billing_friction, …) with evidence, grounded in `risk_patterns`; its outbound edges ARE the play matrix (pattern × severity × ARR) | Fires `save_play_agent` / `qbr_drafter_agent` / `renewals_agent` per matrix row; champion-loss → `account_intel_agent`; strategic / low-confidence → `senior_csm_human`; no-match → audit |
-| `account_intel_agent` | Account Intelligence Analyst | Stakeholder mode: confirms a champion change against the two-signal rule and rebuilds the buying-authority map, grounded in `stakeholder_protocol`. Expansion mode: scores upsell/cross-sell signals | Confirmed change + authority gap → `senior_csm_human`; confirmed, no gap → `csm_human`; expansion ≥ threshold → `ae_human`; else audit |
-| `save_play_agent` | Retention Copywriter (save-play drafter) | Drafts personalised at-risk outreach from the `save_play_library` with alternatives + a clear ask; enforces channel/role whitelists, the exec-signature rule and a quality floor. Never auto-sends | Standard → `csm_human`; exec-routed → `senior_csm_human`; exec-signature (ARR ≥ $500K immediate) → `vp_cs_human` |
-| `qbr_drafter_agent` | QBR Author (executive writer) | Drafts the quarterly business review (Claude + thinking) from the `qbr_template` and real usage data; data-honesty floor forbids invented numbers | Always → `csm_human` for review |
-| `renewals_agent` | Renewals Analyst | Forecasts renewal probability + expansion sizing, grounded in `renewal_forecast_model`; strategic safeguard blocks auto-renew on ARR ≥ $250K; daily 09:00 cron detects 30/60/90-day renewal windows | auto_renew + high confidence → audit; expansion → `ae_human`; save/risk → `senior_csm_human`; low-confidence / risk / strategic → `renewals_manager_human` |
-| `csm_human` | Customer Success Manager (standard accounts) | Reviews, edits and approves drafts for standard accounts before any send | Approve → audit; escalate → `senior_csm_human`; timeout (4h) → escalate (default-deny) |
-| `senior_csm_human` | Senior CSM (named / strategic accounts) | Reviews exec-sponsor plays, strategic-drop alerts and confirmed champion changes | Approve → audit; escalate → `vp_cs_human`; timeout (8h) → escalate |
-| `renewals_manager_human` | Renewals Manager | Owns the renewal window; reviews every strategic-account forecast and negotiates terms | Approve / renegotiate → audit; escalate → `vp_cs_human`; timeout (6h) → escalate |
-| `ae_human` | Account Executive | Owns expansion deals + competitor responses (expansion is a sales motion, never customer-facing CS) | Approve → audit; timeout (4h) → hold for manual review |
-| `vp_cs_human` | VP Customer Success | Board-visibility accounts, strategic plays, final escalation tier | → audit; timeout (12h) → halt for personal review (default-deny) |
+| `health_score_agent` | Customer Health Analyst | Aggregates usage/billing/support/engagement into a 0..100 score + 30d velocity (playbooks: `health_scoring`, `score_explanation`); **memory** reads the account's prior scores across sessions; band + confidence safety floors | Non-healthy bands → `risk_detector_agent`; strategic-drop (ARR ≥ $500K, score fell >10/30d) → `senior_csm_human`; healthy + confident → audit |
+| `risk_detector_agent` | Retention Risk Strategist | Names the churn pattern with evidence (playbooks: `pattern_taxonomy`, `intervention_urgency`); its outbound edges ARE the play matrix (pattern × severity × ARR) | Fires `save_play_agent` / `qbr_drafter_agent` / `renewals_agent` per matrix row; champion-loss → `account_intel_agent`; strategic / low-confidence → `senior_csm_human`; no-match → audit |
+| `account_intel_agent` | Account Intelligence Analyst | Stakeholder mode: confirms a champion change against the two-signal rule and rebuilds the buying-authority map. Expansion mode: scores upsell/cross-sell (playbooks: `stakeholder_alignment`, `expansion_scan`; commented CRM mcp for day-N) | Confirmed change + authority gap → `senior_csm_human`; confirmed, no gap → `csm_human`; expansion ≥ threshold → `ae_human`; else audit |
+| `save_play_agent` | Retention Copywriter (save-play drafter) | **super_agent** that drafts personalised at-risk outreach (playbook: `save_play_craft`) with alternatives + a clear ask; channel/role whitelists, exec-signature rule, quality floor + bounded touch loop. Never auto-sends | Standard → `csm_human`; exec-routed → `senior_csm_human`; exec-signature (ARR ≥ $500K immediate) → `vp_cs_human` |
+| `qbr_drafter_agent` | QBR Author (executive writer) | Drafts the quarterly business review (Claude + thinking; playbook: `qbr_authoring`); data-honesty floor forbids invented numbers | Always → `csm_human` for review |
+| `renewals_agent` | Renewals Analyst | Forecasts renewal probability + expansion sizing (playbook: `renewal_forecast`); strategic safeguard blocks auto-renew on ARR ≥ $250K; daily 09:00 cron (timezone-pinned) detects 30/60/90-day renewal windows | auto_renew + high confidence → audit; expansion → `ae_human`; save/risk → `senior_csm_human`; low-confidence / risk / strategic → `renewals_manager_human` |
+| `account_sweep_agent` | Portfolio Health Sweeper | **Programmatic** base-wide sweep FANNED OUT over `instances: 3`; each copy atomically claims a disjoint account batch (`claim_account_batch`), flags at-risk accounts; daily 07:00 (timezone-pinned) | Combined digest → audit |
+| `play_runner_agent` | Retention Play Executor (finisher) | After a human approves, RUNS the play — SENDS the save-message / BOOKS the QBR — renders a real artifact to `./out` and returns it; fail-closed on unapproved / over-cap (deletes the partial on block); dev-store fallback records the artifact day-0 | → audit (executed or blocked) |
+| `csm_human` | Customer Success Manager (standard accounts) | Reviews, edits and approves drafts for standard accounts before any send | Approve/send/book → `play_runner_agent`; hold → audit; timeout (4h) → held for review (default-deny), Manager escalates |
+| `senior_csm_human` | Senior CSM (named / strategic accounts) | Reviews exec-sponsor plays, strategic-drop alerts and confirmed champion changes | Approve/send/book → `play_runner_agent`; hold → audit; timeout (8h) → held, Manager escalates |
+| `renewals_manager_human` | Renewals Manager | Owns the renewal window; reviews every strategic-account forecast and negotiates terms | Decision → audit; timeout (6h) → held, Manager escalates |
+| `ae_human` | Account Executive | Owns expansion deals + competitor responses (expansion is a sales motion, never customer-facing CS) | Decision → audit; timeout (4h) → held for manual review |
+| `vp_cs_human` | VP Customer Success | Board-visibility accounts, strategic plays, final escalation tier | Approve/send/book → `play_runner_agent`; hold → audit; timeout (12h) → held (default-deny) |
 | `cs_audit_logger_agent` | Compliance Audit Officer | Appends every CS decision and customer touch to a SHA-256 hash-chained WORM log | Terminal sink |
 
-The four self-reliant analysts (`health_score_agent`, `risk_detector_agent`,
-`save_play_agent`, `renewals_agent`) ship an `agency/<name>_agent.py`
-module that auto-binds by filename: a `@pre_compose` that pulls the
-account's real history from the dev store, and a `@chain` that enforces
-the deterministic floors the LLM cannot waive (see Trust mechanisms).
-The three connector agents stay pure YAML (n8n reaches your systems);
-the audit sink is a custom external intelligence function.
+The self-reliant analysts (`health_score_agent`, `risk_detector_agent`,
+`account_intel_agent`, `save_play_agent`, `renewals_agent`) ship an
+`agency/<name>_agent.py` module that auto-binds by filename: a
+`@pre_compose` that pulls the account's real history from the dev store,
+and a `@chain` that enforces the deterministic floors the LLM cannot
+waive (see Trust mechanisms). The `play_runner_agent` finisher and the
+`account_sweep_agent` are programmatic modules too. The three connector
+agents stay pure YAML (n8n reaches your systems); the audit sink is a
+custom external intelligence function. On-demand deep reads go through
+the dev-store tools in `agency/tools.py`, which **announce themselves**
+(`available:false`) when an account is unknown or no source is wired.
 | `cs_operations_agent` | CS Operations Analyst (telemetry) | Sweeps the whole base (mode=sweep) and pulls DAU/feature-breadth/quiet-runs for one account (mode=analytics) from your Pendo/Amplitude/Segment stack via n8n | analytics result → `health_score_agent` as a clean signal |
 | `customer_onboarding_agent` | Onboarding Manager | Tracks post-sale milestones + TTFV in your Salesforce/Gainsight platform via n8n (register-close / milestone-complete / sweep) | Overdue/lagging → `risk_detector_agent`; champion change → `account_intel_agent` |
 | `competitor_intel_agent` | Competitive Intelligence Analyst | Records competitor mentions (channel-weighted) and computes account displacement risk in your Klue/Crayon tooling via n8n | High displacement → `save_play_agent`; stakeholder shift → `account_intel_agent`; alert-only → `risk_detector_agent` |
@@ -136,13 +149,13 @@ the audit sink is a custom external intelligence function.
                  QBR due, renewal window, exec change, manual, …)
                           │
                           ▼
-                  health_score_agent  (knowledge: health_rules)
+                  health_score_agent  (playbook: health_scoring, memory)
             ┌─────────────┼──────────────────────┐
    strategic drop      healthy + conf>=0.7     band != healthy
    (ARR>=$500K,            │                    (non-strategic)
     delta<=-10)            ▼                        │
         │              cs_audit_logger             ▼
-        ▼                                    risk_detector_agent (knowledge: risk_patterns)
+        ▼                                    risk_detector_agent (playbook: pattern_taxonomy)
    senior_csm_human                              │       │
                                       exec_turnover?    requires_human_review?
                                             │            │
@@ -160,7 +173,12 @@ the audit sink is a custom external intelligence function.
                           │     csm_human         │ strategic/low-conf? → renewals_manager
                           ▼
                 csm_human / senior_csm_human / vp_cs_human
-                (HITL — every customer message reviewed before send)
+                (HITL — every customer message reviewed before send;
+                 hold / timeout → audit, Manager escalates the tier)
+                          │ approve / send / book
+                          ▼
+                  play_runner_agent  (FINISHER — re-checks approval +
+                   frequency cap, fails closed, records the artifact)
                           │
                           ▼
                   cs_audit_logger_agent (hash-chained WORM)
@@ -168,6 +186,9 @@ the audit sink is a custom external intelligence function.
 
 Parallel cron responsibilities (NOT in the per-event flow):
 - `renewals_agent` — daily 09:00 window-detection (30/60/90-day accounts).
+- `account_sweep_agent` — daily 07:00 base-wide health sweep, FANNED OUT
+  over `instances: 3` (each copy atomically claims a disjoint batch).
+- Both crons declare a `timezone` (else they fire in UTC — gotcha #13).
 - `cs_operations_agent` / `customer_onboarding_agent` sweeps — shipped
   with `wake_up` crons commented out; enable after wiring the n8n
   connectors.
@@ -269,14 +290,43 @@ curl -X POST http://127.0.0.1:18820/api/mesh/request \
 - **Two-signal corroboration on exec turnover** — `account_intel`
   (stakeholder mode) will not confirm a champion change on a single
   non-CRM signal.
-- **HITL fallback is escalation, never auto-action** — every human's
-  `fallback_response` escalates to the next tier (default-deny); VP CS
-  timeout halts for personal review.
+- **HITL fallback is default-deny, never auto-action** — every human's
+  `fallback_response` resolves to `held_for_review` routed to the audit
+  sink; silence never sends. Tier escalation is the Manager supervisor's
+  job (manager.escalation → VP CS), never a hardcoded human→human wire.
+- **The finisher fails closed** — `play_runner_agent` runs a play only
+  on an explicit approve token (allow-list + block-list; any unknown
+  verdict fails closed) and under the per-account frequency cap. On a
+  clean run it renders a real, inspectable artifact to `./out` (and the
+  dev-store ledger); a blocked run deletes that partial artifact and
+  records the reason — never a half-run file. Verified in
+  `tests/test_agent_logic.py`.
 - **Hash-chained WORM audit** — every customer touch is appended with a
   SHA-256 chain to detect post-hoc tampering.
-- **Knowledge-grounded LLMs** — health rules, save-play library, QBR
-  template, renewal forecast model live in the customer's knowledge
-  base; edit the docs, agents pick them up on next query.
+- **Playbook-grounded LLMs** — the health-scoring rubric, save-play
+  craft, QBR template, risk taxonomy and renewal model ship as per-agent
+  `playbook:` blocks (only the `description` in the prompt; the
+  `responsibility` loads on demand — gotcha #15), so the pod runs day-0
+  with no knowledge backend.
+
+## Modern capabilities (SDK 2.4.131)
+
+- **memory** — `health_score_agent` reads an account's prior scores
+  across sessions, catching the slow multi-week decline a single event
+  misses.
+- **super_agent** — the `save_play_agent` drafter is wrapped in the
+  plan → execute → verify orchestrator (DICT-form tuning only).
+- **instances + atomic claim** — `account_sweep_agent` fans a daily wake
+  into 3 parallel copies that split the account backlog via the
+  thread-locked `claim_account_batch` (no duplicated work).
+- **timezone** — every live `wake_up` cron declares a timezone so it
+  fires in business time, not UTC.
+- **playbooks** — per-intent craft, loaded on demand, on every LLM
+  specialist.
+- **mcp (commented) + dev-store tools** — `account_intel_agent` ships a
+  commented CRM `mcp:` block (an empty-url http mcp is rejected at load);
+  the `agency/tools.py` dev-store tools are the day-0 fallback and
+  announce `available:false` when there's no real source.
 
 ## Tests
 

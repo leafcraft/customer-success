@@ -35,6 +35,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from leafmesh import LeafMeshLogger, chain, pre_compose
@@ -50,13 +51,23 @@ CALENDAR_WEBHOOK_URL = os.getenv("CALENDAR_WEBHOOK_URL", "") or ""
 # Never contact one customer more than this many times in 24h.
 _MAX_PLAYS_PER_DAY = int(os.getenv("CS_MAX_PLAYS_PER_DAY", "3") or "3")
 
-# Tokens a human gate (csm/senior/vp) emits that mean "go".
+# Approve/deny pair (reference finisher doctrine). A human gate go-token is
+# the ONLY thing that runs a play; an explicit block token records WHY it was
+# refused; ANY unknown verdict falls through to fail-closed (not approved).
 _APPROVAL_TOKENS = frozenset({
     "approve", "approved", "send", "book", "approved_to_send",
     "edit_and_send", "forecast_approved",
 })
+_BLOCK_TOKENS = frozenset({
+    "reject", "rejected", "deny", "denied", "no",
+    "hold", "held", "held_for_review",
+})
 # QBR / book vs save / send classification.
 _BOOK_PATTERNS = frozenset({"qbr", "book", "meeting", "review"})
+
+# The real artifact this executor renders — the inspectable record of the play
+# it actually ran. Deleted on a blocked floor (never a half-run artifact).
+_OUT_DIR = Path("./out")
 
 _DEFAULTS: dict[str, Any] = {
     "executed": False,
@@ -70,6 +81,7 @@ _DEFAULTS: dict[str, Any] = {
     "block_reason": "",
     "summary": "",
     "source": "",            # comms_connector | calendar_connector | dev_store
+    "artifact_path": "",     # the ./out record of the run (dropped on block)
 }
 
 
@@ -110,9 +122,51 @@ def load_run_context(data: Any, ctx: Any) -> dict[str, Any]:
         "customer_id": customer_id,
         "action": _resolve_action(data),
         "approval_signal": signal,
+        # Fail closed: only an explicit approve token runs; an explicit block
+        # token is recorded distinctly; anything else is not-approved.
         "approved": signal in _APPROVAL_TOKENS,
+        "explicitly_blocked": signal in _BLOCK_TOKENS,
         "executions_today": store.executions_today(customer_id) if customer_id else 0,
     }
+
+
+# ── real artifact render / delete (reference finisher doctrine) ──────
+def _render_artifact(out: dict[str, Any]) -> str:
+    """Write the inspectable record of the play we ACTUALLY ran to ./out and
+    return its path. This is the finisher's real artifact — the audit sink
+    logs the decision, this file is the thing produced."""
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    cid = str(out.get("customer_id") or "account")
+    art_id = str(out.get("artifact_id") or "play")
+    path = _OUT_DIR / f"{cid}_{out.get('artifact_type') or 'play'}_{art_id}.md"
+    if out.get("action") == "book":
+        lines = [
+            f"# QBR booked — {cid}",
+            f"Meeting id: {art_id}",
+            f"Slot: {out.get('slot','')}",
+            f"Source: {out.get('source','')}",
+            "",
+            "_Human-approved. Booked via the calendar connector (or dev-store fallback)._",
+        ]
+    else:
+        lines = [
+            f"# Save-message sent — {cid}",
+            f"Message id: {art_id}",
+            f"Channel: {out.get('channel','')}",
+            f"Source: {out.get('source','')}",
+            "",
+            "_Human-approved. Sent via the comms connector (or dev-store fallback)._",
+        ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
+
+
+def _delete_partial(out: dict[str, Any]) -> None:
+    """Drop any ./out artifact when the floor blocks — never a half-run file."""
+    p = out.get("artifact_path")
+    if p:
+        Path(p).unlink(missing_ok=True)
+    out["artifact_path"] = ""
 
 
 # ── connector dispatch (inert until the webhook env var is set) ──────
@@ -176,15 +230,20 @@ async def enforce_approval_and_cap(result: dict[str, Any], ctx: Any) -> dict[str
 
     rc = extract.prepared_context(ctx)
     approved = bool(rc.get("approved"))
+    explicitly_blocked = bool(rc.get("explicitly_blocked"))
     over_cap = int(rc.get("executions_today", 0)) >= _MAX_PLAYS_PER_DAY
 
     if not approved or over_cap:
-        reason = ("play not human-approved — refusing to execute"
-                  if not approved else
-                  f"frequency cap hit ({_MAX_PLAYS_PER_DAY}/day) — refusing to execute")
+        if over_cap and approved:
+            reason = f"frequency cap hit ({_MAX_PLAYS_PER_DAY}/day) — refusing to execute"
+        elif explicitly_blocked:
+            reason = "approver rejected / held the play — refusing to execute"
+        else:
+            reason = "play not human-approved — refusing to execute (fail closed)"
         logger.warning(f"[play_runner] BLOCKED: {reason} "
                        f"(customer={result.get('customer_id') or '?'})")
-        # Fail closed: no artifact survives a blocked run.
+        # Fail closed: no artifact survives a blocked run — drop the ./out file too.
+        _delete_partial(result)
         result.update({
             "executed": False, "blocked": True, "block_reason": reason,
             "artifact_id": "", "artifact_type": "",
@@ -230,6 +289,7 @@ async def play_runner_agent(llm_response: Any, input_data: Any, context: Any) ->
             "summary": f"Booked QBR {res['artifact_id']} for {customer_id} "
                        f"at {res['slot']} ({res['source']}).",
         })
+        out["artifact_path"] = _render_artifact(out)
     else:
         channel = str(extract.pick(input_data, "proposed_channel", "")
                       or extract.pick(input_data, "channel", "") or "email")
@@ -244,4 +304,5 @@ async def play_runner_agent(llm_response: Any, input_data: Any, context: Any) ->
             "summary": f"Sent save-message {res['artifact_id']} to {customer_id} "
                        f"via {channel} ({res['source']}).",
         })
+        out["artifact_path"] = _render_artifact(out)
     return out

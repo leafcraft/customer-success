@@ -16,9 +16,12 @@ account. That cell of the play matrix (one conditional edge on the risk
 detector) fires `save_play_agent`, which drafts a specific, warm
 outreach — never auto-sent. Because the account is $300K and urgent,
 recipient_role is `exec_sponsor`, so the draft lands in
-`senior_csm_human`'s inbox. The senior CSM edits, approves, sends. Every
-hop is appended to the hash-chained WORM audit. Had no one responded in
-8h, the gate would escalate to VP CS, never auto-act.
+`senior_csm_human`'s inbox. The senior CSM edits and approves, and the
+`play_runner_agent` finisher sends it (re-checking the approval + the
+per-account cap first). Every hop is appended to the hash-chained WORM
+audit. Had no one responded in 8h, the gate would hold for review
+(default-deny) and the Manager supervisor would escalate to VP CS —
+never auto-act.
 
 ## Flow diagram
 
@@ -30,13 +33,13 @@ hop is appended to the hash-chained WORM audit. Had no one responded in
                  expansion_scan · onboarding/competitor ingest)
                           │
                           ▼
-                  health_score_agent  (LLM, knowledge: health_rules)
+                  health_score_agent  (LLM chain, playbook + memory)
             ┌─────────────┼───────────────────────┐
    strategic drop      healthy + conf>=0.7      band != healthy
    ARR>=$500K          → cs_audit_logger         (non-strategic)
    delta<=-10                                         │
         │                                             ▼
-        ▼                                   risk_detector_agent (LLM, risk_patterns)
+        ▼                                   risk_detector_agent (LLM chain, playbook)
    senior_csm_human                              │            │
                                        requires_stakeholder?  requires_human_review?
                                               │                │
@@ -56,8 +59,13 @@ hop is appended to the hash-chained WORM audit. Had no one responded in
                         │                         └─ low-conf/risk/strategic
                         ▼                            → renewals_manager
             csm_human / senior_csm_human / vp_cs_human
-            (HITL — every customer message reviewed before send)
-                        │ (approve / escalate / timeout→escalate)
+            (HITL — every customer message reviewed before send;
+             hold / timeout → audit, Manager escalates the tier)
+                        │ approve / send / book
+                        ▼
+              play_runner_agent  (FINISHER — re-checks approval + cap,
+               fails closed, records the artifact) → audit
+                        │
                         ▼
               cs_audit_logger_agent  (external custom — hash-chained WORM)
 
@@ -66,8 +74,10 @@ hop is appended to the hash-chained WORM audit. Had no one responded in
     customer_onboarding_agent → Salesforce/Gainsight     (overdue → risk_detector)
     competitor_intel_agent    → Klue/Crayon              (displacement → save_play)
 
-  Cron citizens (parallel, NOT in the per-event flow):
-    renewals_agent  — 09:00 daily 30/60/90-day window detection
+  Cron citizens (parallel, NOT in the per-event flow; timezone-pinned):
+    renewals_agent      — 09:00 daily 30/60/90-day window detection
+    account_sweep_agent — 07:00 daily base-wide sweep, instances: 3
+                          (each copy claims a disjoint account batch)
     cs_operations / onboarding sweeps — wake_up shipped commented
 ```
 
@@ -75,21 +85,27 @@ hop is appended to the hash-chained WORM audit. Had no one responded in
 
 | Agent | Role (job title) | Type |
 |---|---|---|
-| `health_score_agent` | Customer Health Analyst | llm |
-| `risk_detector_agent` | Retention Risk Strategist | llm (dual) |
-| `account_intel_agent` | Account Intelligence Analyst | llm (dual, mode-dispatched) |
-| `save_play_agent` | Retention Copywriter | llm (dual) |
-| `qbr_drafter_agent` | QBR Author | llm (Claude + thinking) |
-| `renewals_agent` | Renewals Analyst | llm (dual) + 09:00 cron |
-| `csm_human` | Customer Success Manager (standard) | human |
-| `senior_csm_human` | Senior CSM (named/strategic) | human |
-| `renewals_manager_human` | Renewals Manager | human |
-| `ae_human` | Account Executive | human |
-| `vp_cs_human` | VP Customer Success | human |
+| `health_score_agent` | Customer Health Analyst | llm (chain) + memory |
+| `risk_detector_agent` | Retention Risk Strategist | llm (chain) |
+| `account_intel_agent` | Account Intelligence Analyst | llm (chain, mode-dispatched) |
+| `save_play_agent` | Retention Copywriter | llm (chain) + super_agent |
+| `qbr_drafter_agent` | QBR Author | llm (chain, Claude + thinking) |
+| `renewals_agent` | Renewals Analyst | llm (chain) + 09:00 cron |
+| `account_sweep_agent` | Portfolio Health Sweeper | programmatic + instances: 3 + 07:00 cron |
+| `play_runner_agent` | Retention Play Executor (finisher) | programmatic |
+| `csm_human` | Customer Success Manager (standard) | human (dual) |
+| `senior_csm_human` | Senior CSM (named/strategic) | human (dual) |
+| `renewals_manager_human` | Renewals Manager | human (dual) |
+| `ae_human` | Account Executive | human (dual) |
+| `vp_cs_human` | VP Customer Success | human (dual) |
 | `cs_audit_logger_agent` | Compliance Audit Officer | external (custom) |
 | `cs_operations_agent` | CS Operations Analyst (telemetry) | programmatic (n8n) |
 | `customer_onboarding_agent` | Onboarding Manager | programmatic (n8n) |
 | `competitor_intel_agent` | Competitive Intelligence Analyst | programmatic (n8n) |
+
+AI specialists are `chain` (a `dual→dual` edge auto-bounces replies — gotcha
+#17); `dual` is confined to the human/webhook boundary. Human tiers do not wire
+to each other — escalation is the Manager supervisor's job.
 
 ## Data artifacts
 
@@ -111,34 +127,50 @@ hop is appended to the hash-chained WORM audit. Had no one responded in
 
 ## Per-agent spec (grounded in config.yaml)
 
-- **health_score_agent** (llm, `health_rules`) — scores + explains in
-  one pass; deterministic band derivation; safety floor (low-confidence
-  "healthy" → "watch"); quality floor (no defensible summary → cap
-  confidence 0.3). Edges: strategic-drop → `senior_csm_human`;
-  non-healthy (non-strategic) → `risk_detector_agent`; healthy+confident
-  → audit.
-- **risk_detector_agent** (llm dual, `risk_patterns`) — names one of a
-  closed pattern set; its outbound edges **are** the play matrix; sets
-  `requires_stakeholder_map` / `requires_human_review`. Peer-calls
-  `account_intel_agent`.
-- **account_intel_agent** (llm dual, `stakeholder_protocol`) — two
-  responsibilities by mode; two-signal confirmation rule; expansion
-  floor thresholds. Mode-gated edges prevent cross-fire.
-- **save_play_agent** (llm dual, `save_play_library`) — drafts at-risk
-  outreach; channel/role whitelists; exec-signature rule; quality
-  floor; three mutually-exclusive review-tier edges.
-- **qbr_drafter_agent** (llm, Claude + thinking, `qbr_template`) —
-  data-honesty floor; always → `csm_human`.
-- **renewals_agent** (llm dual, `renewal_forecast_model`, 09:00 cron) —
-  forecast + expansion sizing + window detection; strategic safeguard
-  (no auto_renew ≥ $250K) AND strategic edge (`arr_cents >= 25000000`
-  → `renewals_manager_human`); window-scan runs are terminal.
+- **health_score_agent** (llm chain, playbooks `health_scoring` /
+  `score_explanation`, **memory**) — scores + explains in one pass;
+  deterministic band derivation; safety floor (low-confidence "healthy" →
+  "watch"); quality floor (no defensible summary → cap confidence 0.3).
+  Edges: strategic-drop → `senior_csm_human`; non-healthy (non-strategic)
+  → `risk_detector_agent`; healthy+confident → audit.
+- **risk_detector_agent** (llm chain, playbooks `pattern_taxonomy` /
+  `intervention_urgency`) — names one of a closed pattern set; its
+  outbound edges **are** the play matrix; sets `requires_stakeholder_map`
+  / `requires_human_review`. Calls `account_intel_agent`.
+- **account_intel_agent** (llm chain, playbooks `stakeholder_alignment` /
+  `expansion_scan`; commented CRM `mcp:`) — two responsibilities by mode;
+  two-signal confirmation rule; expansion floor thresholds. Mode-gated
+  edges prevent cross-fire.
+- **save_play_agent** (llm chain, **super_agent** dict, playbook
+  `save_play_craft`) — drafts at-risk outreach; channel/role whitelists;
+  exec-signature rule; quality floor + bounded touch loop; three
+  mutually-exclusive review-tier edges.
+- **qbr_drafter_agent** (llm chain, Claude + thinking, playbook
+  `qbr_authoring`) — data-honesty floor; always → `csm_human`.
+- **renewals_agent** (llm chain, playbook `renewal_forecast`, 09:00 cron
+  + timezone) — forecast + expansion sizing + window detection; strategic
+  safeguard (no auto_renew ≥ $250K) AND strategic edge (`arr_cents >=
+  25000000` → `renewals_manager_human`); window-scan runs are terminal.
+- **account_sweep_agent** (programmatic, `instances: 3`, 07:00 cron +
+  timezone) — base-wide health sweep; each copy atomically claims a
+  disjoint account batch (`claim_account_batch`) and flags at-risk
+  accounts; combined digest → audit. The atomic claim is the fan-out
+  contract (numbers SUM, lists CONCAT under `instances_handoff: last`).
+- **play_runner_agent** (programmatic FINISHER) — after a human approves,
+  RUNS the play: SENDS the save-message / BOOKS the QBR and returns the
+  artifact. `@chain` fails closed on an unapproved verdict (allow-token
+  list; unknown → blocked) or an over-cap account, dropping the artifact.
+  Dev-store fallback records the artifact day-0.
 - **Human tiers** — `csm`/`senior_csm`/`renewals_manager`/`ae`/`vp_cs`,
-  each default-deny on timeout, each escalating to the next tier.
+  each default-deny on timeout (`held_for_review` → audit). Approvals go
+  to `play_runner_agent`; tier escalation is the Manager supervisor's job
+  (manager.escalation → VP CS), never a human→human wire.
 - **cs_audit_logger_agent** (external custom) — registered via
   `mesh.intelligence("cs_audit_logger_agent")` in `main.py`; terminal.
 - **Connector agents** (programmatic n8n) — pure YAML; inert until the
   webhook URL is wired; results returned in the declared yields shape.
+- **Dev-store tools** (`agency/tools.py`) — on-demand deep reads +
+  the atomic claim; each announces `available:false` with no real source.
 
 ## Entry points
 
@@ -181,7 +213,7 @@ into a `channels:` adapter to actually post.
 
 - **Deep AND usable.** The play matrix and tiers live in prompts +
   conditional edges (legible to an auditor), but the load-bearing floors
-  are ALSO enforced in Python the LLM can't waive. Four self-reliant
+  are ALSO enforced in Python the LLM can't waive. Five self-reliant
   analysts ship an auto-binding `agency/<name>_agent.py`:
   - `@pre_compose` pulls the account's real history (rolling signal
     window, usage/adoption, prior plays, ARR/renewal record) from a dev
@@ -219,7 +251,17 @@ into a `channels:` adapter to actually post.
   (5) `env` documented `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` as
   plug-and-play escalation channels though they are consumed nowhere →
   comments corrected to "wire into a channels adapter."
+- **Modern capabilities (SDK 2.4.131), fitted to the domain.** memory
+  (cross-session health on `health_score_agent`); super_agent (DICT-form)
+  on the `save_play_agent` drafter; per-intent `playbook:` blocks
+  replacing the mongo knowledge groups so the pod runs day-0; `instances:
+  3` + an atomic claim (`claim_account_batch`) on `account_sweep_agent`
+  for backlog fan-out; a `timezone` on every live `wake_up`; a commented
+  CRM `mcp:` block on `account_intel_agent` backed by `agency/tools.py`
+  dev-store tools that announce `available:false` with no real source.
 - **Conservative where unverifiable.** The live `start()` path requires
   a license key not present in this environment; verification rests on
-  `validate_config`, real-SDK `from_yaml` (15 agents parsed), direct
-  condition-evaluator tests of the new edges, and the test suite.
+  `validate_config` (all checks pass), real-SDK `from_yaml` on 2.4.131
+  (17 agents parsed, **0 dual warnings**), direct calls to the `@chain`
+  finisher / floor functions and the atomic claim, and the test suite
+  (71 passing).
