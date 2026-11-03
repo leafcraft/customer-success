@@ -10,9 +10,9 @@ through the n8n connector agents in config.yaml:
   * health history + signals  → Gainsight / Pendo / Amplitude / Segment
   * renewal / ARR records     → Salesforce / your CRM
   * prior plays               → your CS playbook ledger / Gainsight CTAs
-Setting the N8N_* env vars alone does nothing until those workflows
-return JSON; this module is the day-0 stand-in. The function signatures
-are the contract — swap the body, keep the shape.
+Until those connectors are wired (their vault records exist and the
+workflows return JSON), this module is the day-0 stand-in. The function
+signatures are the contract — swap the body, keep the shape.
 """
 from __future__ import annotations
 
@@ -184,6 +184,134 @@ _SEED_ACCOUNTS: list[dict[str, Any]] = [
         "stakeholders": [],   # tech-touch — no mapped relationship
         "prior_plays": [],
     },
+    # ── The four accounts the examples/ payloads drive (same ids + ARR) ──
+    {
+        # examples/01 — DAU down ~35% week-over-week; two features abandoned.
+        "customer_id": "cust-bytewing-021",
+        "account_id": "acc-bytewing",
+        "name": "Bytewing Labs",
+        "segment": "mid_market",
+        "tier": "standard",
+        "arr_cents": 8_400_000,           # $84K — above the $50K usage-decay save floor
+        "renewal_date": _days_from_now(131),
+        "csm": "ravi",
+        "signals": [
+            {"at": _days_ago_iso(1),  "source": "telemetry", "type": "usage_drop",
+             "value": -0.35, "note": "DAU 142 vs 218 baseline (-35% wow)"},
+            {"at": _days_ago_iso(6),  "source": "telemetry", "type": "feature_drop",
+             "value": -0.50, "note": "analytics_dashboard + api_explorer unused for 6 days"},
+            {"at": _days_ago_iso(19), "source": "billing",   "type": "on_time_pay",
+             "value": 1,     "note": "Q3 invoice paid on time"},
+        ],
+        "usage": {
+            "dau_7d_avg": 142, "dau_28d_avg": 218, "dau_delta_pct": -0.35,
+            "feature_breadth": 5, "longest_quiet_run_days": 4,
+            "seat_utilisation": 0.58, "api_utilisation": 0.22,
+            "premium_features_touched": [], "nps": 6, "csat": 3.8,
+        },
+        "stakeholders": [
+            {"name": "Elena Varga", "title": "Head of Data", "role": "champion",
+             "status": "in_role", "buying_authority": True, "last_verified": _days_ago_iso(28)},
+        ],
+        "prior_plays": [],
+    },
+    {
+        # examples/02 — renewal charge failed twice (card declined).
+        "customer_id": "cust-orbital-systems-008",
+        "account_id": "acc-orbital",
+        "name": "Orbital Systems",
+        "segment": "enterprise",
+        "tier": "named_account",
+        "arr_cents": 14_200_000,          # $142K; monthly invoice $11,833.33
+        "renewal_date": _days_from_now(12),
+        "csm": "maya",
+        "signals": [
+            {"at": _days_ago_iso(1),  "source": "billing",   "type": "failed_payment",
+             "value": -1,    "note": "renewal charge $11,833.33 declined (retry 2 of 3)"},
+            {"at": _days_ago_iso(4),  "source": "billing",   "type": "failed_payment",
+             "value": -1,    "note": "renewal charge $11,833.33 declined (retry 1 of 3)"},
+            {"at": _days_ago_iso(16), "source": "telemetry", "type": "usage_flat",
+             "value": 0.0,   "note": "usage steady"},
+        ],
+        "usage": {
+            "dau_7d_avg": 96, "dau_28d_avg": 99, "dau_delta_pct": -0.03,
+            "feature_breadth": 8, "longest_quiet_run_days": 1,
+            "seat_utilisation": 0.79, "api_utilisation": 0.61,
+            "premium_features_touched": ["sso"], "nps": 7, "csat": 4.2,
+        },
+        "stakeholders": [
+            {"name": "Marcus Oyelaran", "title": "Director of IT", "role": "champion",
+             "status": "in_role", "buying_authority": True, "last_verified": _days_ago_iso(9)},
+            {"name": "Hana Ito", "title": "AP Manager", "role": "billing_contact",
+             "status": "in_role", "buying_authority": False, "last_verified": _days_ago_iso(9)},
+        ],
+        "prior_plays": [],
+    },
+    {
+        # examples/03 — 60 days from renewal; 122 of 145 seats active.
+        "customer_id": "cust-northgate-analytics-003",
+        "account_id": "acc-northgate",
+        "name": "Northgate Analytics",
+        "segment": "enterprise",
+        "tier": "named_account",
+        "arr_cents": 32_500_000,          # $325K — strategic: never auto_renew
+        "renewal_date": _days_from_now(60),
+        "csm": "maya",
+        "signals": [
+            {"at": _days_ago_iso(5),  "source": "support",   "type": "ticket_volume",
+             "value": 2,     "note": "2 tickets this month (8 in 90 days)"},
+            {"at": _days_ago_iso(14), "source": "telemetry", "type": "usage_flat",
+             "value": 0.0,   "note": "122 of 145 seats active in 30 days"},
+            {"at": _days_ago_iso(25), "source": "survey",    "type": "nps",
+             "value": 7,     "note": "NPS 7 from the champion"},
+        ],
+        "usage": {
+            "dau_7d_avg": 118, "dau_28d_avg": 121, "dau_delta_pct": -0.02,
+            "feature_breadth": 10, "longest_quiet_run_days": 1,
+            "seat_utilisation": 0.84, "api_utilisation": 0.70,
+            "premium_features_touched": ["audit_log"], "nps": 7, "csat": 4.3,
+        },
+        "stakeholders": [
+            {"name": "Lia Chen", "title": "VP Analytics", "role": "champion",
+             "status": "in_role", "buying_authority": True, "last_verified": _days_ago_iso(7)},
+            {"name": "Owen Brandt", "title": "Procurement Lead", "role": "procurement",
+             "status": "in_role", "buying_authority": False, "last_verified": _days_ago_iso(30)},
+        ],
+        "prior_plays": [
+            {"play": "qbr", "at": _days_ago_iso(88), "outcome": "attended", "pattern": ""},
+        ],
+    },
+    {
+        # examples/04 — champion (VP Operations) left; a director is the new contact.
+        "customer_id": "cust-pacific-shipping-014",
+        "account_id": "acc-pacship",
+        "name": "Pacific Coast Shipping",
+        "segment": "smb",
+        "tier": "standard",
+        "arr_cents": 5_600_000,           # $56K
+        "renewal_date": _days_from_now(203),
+        "csm": "ravi",
+        "signals": [
+            {"at": _days_ago_iso(2),  "source": "exec_change", "type": "champion_left",
+             "value": 1,     "note": "CRM: VP Operations J. Morales left the company"},
+            {"at": _days_ago_iso(3),  "source": "support",     "type": "email_bounce",
+             "value": 1,     "note": "champion email bounced"},
+        ],
+        "usage": {
+            "dau_7d_avg": 34, "dau_28d_avg": 37, "dau_delta_pct": -0.08,
+            "feature_breadth": 6, "longest_quiet_run_days": 2,
+            "seat_utilisation": 0.71, "api_utilisation": 0.15,
+            "premium_features_touched": [], "nps": 8, "csat": 4.0,
+        },
+        "stakeholders": [
+            {"name": "Javier Morales", "title": "VP Operations", "role": "champion",
+             "status": "departed", "buying_authority": True, "last_verified": _days_ago_iso(2),
+             "departure_signal": "crm_update+email_bounce"},
+            {"name": "Kiran Singh", "title": "Director Logistics", "role": "user_lead",
+             "status": "in_role", "buying_authority": False, "last_verified": _days_ago_iso(2)},
+        ],
+        "prior_plays": [],
+    },
 ]
 
 # Index by customer_id for O(1) reads.
@@ -347,6 +475,25 @@ def record_play(customer_id: str, play: str, pattern: str = "",
     return rec
 
 
+def save_touches(customer_id: str, days: int = 30) -> int:
+    """Save-messages actually SENT to this account in the last `days` days —
+    the touch count the save_play @chain caps. Drafts don't count (only a
+    message the customer received is a touch). PROD: your comms ledger /
+    Gainsight CTA history."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    n = 0
+    for p in prior_plays(customer_id):
+        if p.get("play") != "save" or p.get("outcome") == "drafted":
+            continue
+        try:
+            at = datetime.fromisoformat(str(p.get("at")))
+        except (ValueError, TypeError):
+            continue
+        if at >= cutoff:
+            n += 1
+    return n
+
+
 def set_health_snapshot(customer_id: str, health_score: float,
                         risk_band: str, score_delta_30d: float) -> None:
     """Persist the latest computed health snapshot for trend reads."""
@@ -438,7 +585,7 @@ def _placeholder_slot() -> str:
 
 # ─────────────────────────────────────────────────────────────────────
 # BACKLOG FAN-OUT QUEUE — the atomic claim the account_sweep_agent's
-# parallel instances use to SPLIT the account base instead of duplicating
+# parallel copies use to SPLIT the account base instead of duplicating
 # it. Thread-locked, LPOP-style: each claim atomically removes up to
 # `count` ids. Keyed by `gen` (the sweep's session id) so the copies in
 # ONE wake share a drained queue (a drained gen returns available:false —
@@ -461,7 +608,7 @@ def reset_backlog() -> None:
 
 def claim_account_batch(count: int = 5, gen: str = "") -> dict[str, Any]:
     """Atomically claim up to `count` account ids from the shared sweep
-    backlog so parallel sweep instances pull DISJOINT batches.
+    backlog so parallel sweep copies pull DISJOINT batches.
 
     `gen` scopes a sweep run (pass the session id): a new gen re-seeds the
     backlog from the account base; the same gen drains it and then returns

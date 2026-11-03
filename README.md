@@ -2,8 +2,9 @@
 
 A LeafMesh deployment that watches the whole customer base for risk
 signals **before** customers escalate or churn. A peer-to-peer team of
-governed agents (Rule 1) — the Manager hovers above and intervenes only
-on narration / escalation / contract violations.
+governed agents (Rule 1) — the Manager hovers above: it raises hard or
+repeated errors to the VP CS and alerts on contract violations; it does
+not route the work.
 
 ## Story — one signal, end to end
 
@@ -34,9 +35,10 @@ personalisation, approves, and the **play_runner_agent** finisher sends
 it (fail-closed: it re-checks the approval and the per-account frequency
 cap before any send). Every hop — the score, the pattern, the draft, the
 approval, the send — is appended to the hash-chained
-**cs_audit_logger_agent** WORM log. If the senior CSM had not responded
-within 8 hours, the gate would have **held for review** (default-deny)
-and the Manager supervisor would escalate to VP CS — never auto-acted.
+**cs_audit_logger_agent** WORM log. If the senior CSM had not answered
+within 8 hours, the request would wait no longer: its Inbox card closes
+and the ticket records that no reply came. Nothing is sent on silence,
+and nobody is chased automatically.
 
 Maya never opened a dashboard. She got one reviewed draft for the one
 account that needed her, with the reasoning attached.
@@ -56,7 +58,7 @@ protecting revenue you already have. This template realises the
   **~$25-30M of ARR that walks out as churn**. The headline number
   comes from both.
 - **Trust posture**: every customer-facing send is HITL-reviewed;
-  human gates are default-deny on timeout; strategic accounts carry
+  nothing is sent when a reviewer does not answer; strategic accounts carry
   hard safeguards (no `auto_renew` on ARR ≥ $250K; two-signal
   corroboration before confirming a champion change).
 
@@ -82,33 +84,52 @@ Copy `env` → `.env` and fill in. Grounded in the actual `env` +
 
 | Var | Required | Purpose |
 |---|---|---|
-| `PAGER_WEBHOOK` | optional | manager escalation → PagerDuty-style webhook (consumed in `config.yaml`) |
-| `SLACK_CS_CHANNEL` | optional | manager escalation Slack channel id (consumed in `config.yaml`) |
-| `SLACK_BOT_TOKEN` | optional | **not auto-consumed** by the escalation block — wire into a `channels:` slack adapter to actually post |
-| `SLACK_SIGNING_SECRET` | optional | only for an inbound Slack adapter — wire in code/config |
+| *(vault connection `escalation_webhook`)* | optional | manager escalation → PagerDuty-style webhook: create vault connection `escalation_webhook` (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook'), then uncomment the webhook target (in `configs/config.yaml` before the first start, in Studio's YAML editor after it) |
+| `SLACK_CS_CHANNEL` | optional | Slack channel id for the manager's Slack escalation target — shipped commented in `config.yaml` |
+| *(vault Slack connection)* | optional | the Slack target needs a Slack channel adapter: connect Slack on a human seat (a vault Slack record, Infrastructure → Messaging → Slack), then uncomment the target. The bot token / signing secret live only in the vault — not in `.env`, and refused inline in the config |
 
 ### Tier 3 — Connectors (inert until wired)
 
-The three connector agents are pure-YAML n8n calls. Each webhook is
-referenced in `config.yaml`; the agent stays inert (and its `wake_up`
-cron stays commented) until you point the URL at a live n8n workflow
-that returns JSON in the declared `yields` shape.
+The three connector agents are pure-YAML n8n calls. Addresses and tokens
+live **only in the vault** (a URL or token written in `config.yaml` is
+refused at load): create each connection (n8n ones: on Infrastructure → Integrations → n8n, or an "Add custom" record with service type
+Tools — base URL = the workflow's webhook URL, secret = its auth token),
+then uncomment the agent's `connector_config:` lines — in `configs/config.yaml`
+before the first start, in Studio's YAML editor after it (see *Changing the
+configuration after the first start*). Each agent stays
+inert (and its `wake_up` cron stays commented) until its connection points
+at a live n8n workflow that returns JSON in the declared `yields` shape.
 
-| Var | Required | Connector agent → your system |
+| Vault connection | Required | Connector agent → your system |
 |---|---|---|
-| `N8N_CS_OPERATIONS_WEBHOOK_URL` | optional | `cs_operations_agent` → Pendo / Amplitude / Segment |
-| `N8N_CUSTOMER_ONBOARDING_WEBHOOK_URL` | optional | `customer_onboarding_agent` → Salesforce / Gainsight |
-| `N8N_COMPETITOR_INTEL_WEBHOOK_URL` | optional | `competitor_intel_agent` → Klue / Crayon |
-| `CRM_MCP_URL` / `CRM_MCP_TOKEN` | optional | `account_intel_agent`'s commented CRM `mcp:` block → your CRM / CS platform (uncomment the block after setting the URL); until then the `agency/tools.py` dev-store tools serve day-0 |
+| `cs_operations_n8n` | optional | `cs_operations_agent` → Pendo / Amplitude / Segment |
+| `customer_onboarding_n8n` | optional | `customer_onboarding_agent` → Salesforce / Gainsight |
+| `competitor_intel_n8n` | optional | `competitor_intel_agent` → Klue / Crayon |
+| `crm_mcp` | optional | `account_intel_agent`'s commented CRM `mcp:` block → your CRM / CS platform's MCP server (URL + token); until then the `agency/tools.py` dev-store tools serve day-0 |
+| `cs_comms_webhook` | optional | `play_runner_agent` sends the approved save-message through your comms platform (Slack / email gateway / CPaaS) |
+| `cs_calendar_webhook` | optional | `play_runner_agent` books the approved QBR through your calendar or booking tool |
+
+`cs_comms_webhook` and `cs_calendar_webhook` are "Add custom" records on the
+Infrastructure page, service type 'Outbound webhook': base URL = the address,
+the token as a secret header row. `agency/play_runner_agent.py` reads them with
+`leafmesh.connection_rows` and uses the message / meeting id your system
+answers with. With no record, it records the send / booking in the dev store
+(`source: dev_store`). The dev-store tools in `agency/tools.py` check whether
+the `crm_mcp` / `cs_operations_n8n` / `customer_onboarding_n8n` records exist,
+only to word an empty answer. Nothing in `.env` switches any of this.
 
 ## Agent table (the department)
 
 Role = the human job title a VP of Customer Success would recognise.
 Grounded in each agent's actual type, playbook, tools and edges in
-`configs/config.yaml`. Human tiers no longer hand off to each other
+`configs/config.yaml`. Human tiers do not hand off to each other
 (a `dual→dual` footgun, gotcha #17): a gate either approves → the
-finisher, or holds → audit, and the **Manager supervisor** owns tier
-escalation (manager.escalation → `vp_cs_human`).
+finisher, or holds → audit. Which tier a request lands on is decided
+up front by the routing (ARR, urgency, touch count), not by a timeout.
+If a reviewer does not answer within their window, the request waits
+no longer: its Inbox card closes and the ticket records that no reply
+came. Nothing is sent or approved on silence, and nobody is chased
+automatically.
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
@@ -118,13 +139,13 @@ escalation (manager.escalation → `vp_cs_human`).
 | `save_play_agent` | Retention Copywriter (save-play drafter) | **super_agent** that drafts personalised at-risk outreach (playbook: `save_play_craft`) with alternatives + a clear ask; channel/role whitelists, exec-signature rule, quality floor + bounded touch loop. Never auto-sends | Standard → `csm_human`; exec-routed → `senior_csm_human`; exec-signature (ARR ≥ $500K immediate) → `vp_cs_human` |
 | `qbr_drafter_agent` | QBR Author (executive writer) | Drafts the quarterly business review (Claude + thinking; playbook: `qbr_authoring`); data-honesty floor forbids invented numbers | Always → `csm_human` for review |
 | `renewals_agent` | Renewals Analyst | Forecasts renewal probability + expansion sizing (playbook: `renewal_forecast`); strategic safeguard blocks auto-renew on ARR ≥ $250K; daily 09:00 cron (timezone-pinned) detects 30/60/90-day renewal windows | auto_renew + high confidence → audit; expansion → `ae_human`; save/risk → `senior_csm_human`; low-confidence / risk / strategic → `renewals_manager_human` |
-| `account_sweep_agent` | Portfolio Health Sweeper | **Programmatic** base-wide sweep FANNED OUT over `instances: 3`; each copy atomically claims a disjoint account batch (`claim_account_batch`), flags at-risk accounts; daily 07:00 (timezone-pinned) | Combined digest → audit |
-| `play_runner_agent` | Retention Play Executor (finisher) | After a human approves, RUNS the play — SENDS the save-message / BOOKS the QBR — renders a real artifact to `./out` and returns it; fail-closed on unapproved / over-cap (deletes the partial on block); dev-store fallback records the artifact day-0 | → audit (executed or blocked) |
-| `csm_human` | Customer Success Manager (standard accounts) | Reviews, edits and approves drafts for standard accounts before any send | Approve/send/book → `play_runner_agent`; hold → audit; timeout (4h) → held for review (default-deny), Manager escalates |
-| `senior_csm_human` | Senior CSM (named / strategic accounts) | Reviews exec-sponsor plays, strategic-drop alerts and confirmed champion changes | Approve/send/book → `play_runner_agent`; hold → audit; timeout (8h) → held, Manager escalates |
-| `renewals_manager_human` | Renewals Manager | Owns the renewal window; reviews every strategic-account forecast and negotiates terms | Decision → audit; timeout (6h) → held, Manager escalates |
-| `ae_human` | Account Executive | Owns expansion deals + competitor responses (expansion is a sales motion, never customer-facing CS) | Decision → audit; timeout (4h) → held for manual review |
-| `vp_cs_human` | VP Customer Success | Board-visibility accounts, strategic plays, final escalation tier | Approve/send/book → `play_runner_agent`; hold → audit; timeout (12h) → held (default-deny) |
+| `account_sweep_agent` | Portfolio Health Sweeper | **Programmatic** base-wide sweep FANNED OUT over `scaling.copies.count: 3`; each copy atomically claims a disjoint account batch (`claim_account_batch`), flags at-risk accounts; daily 07:00 (timezone-pinned) | Combined digest → audit |
+| `play_runner_agent` | Retention Play Executor (finisher) | After a human approves, RUNS the play — SENDS the save-message / BOOKS the QBR through the `cs_comms_webhook` / `cs_calendar_webhook` vault records — renders a real artifact to `./out` and returns it; fail-closed on unapproved / over-cap (2 plays per account per 24h) / empty message (deletes the partial on block); dev-store fallback records the artifact day-0 | → audit (executed or blocked) |
+| `csm_human` | Customer Success Manager (standard accounts) | Reviews, edits and approves drafts for standard accounts before any send | Approve/send/book → `play_runner_agent`; hold or any other reply → audit; no answer in 4h → card closes, nothing sent |
+| `senior_csm_human` | Senior CSM (named / strategic accounts) | Reviews exec-sponsor plays, plays past the touch cap, strategic-drop alerts and confirmed champion changes | Approve/send/book → `play_runner_agent`; hold or any other reply → audit; no answer in 8h → card closes, nothing sent |
+| `renewals_manager_human` | Renewals Manager | Owns the renewal window; reviews every strategic-account forecast and negotiates terms | Every reply → audit; no answer in 6h → card closes |
+| `ae_human` | Account Executive | Owns expansion deals (expansion is a sales motion, never customer-facing CS) | Every reply → audit; no answer in 4h → card closes |
+| `vp_cs_human` | VP Customer Success | Strategic plays (ARR ≥ $500K, immediate) needing a personal note; receives the Manager's error alerts | Approve/send/book → `play_runner_agent`; hold or any other reply → audit; no answer in 12h → card closes, nothing sent |
 | `cs_audit_logger_agent` | Compliance Audit Officer | Appends every CS decision and customer touch to a SHA-256 hash-chained WORM log | Terminal sink |
 
 The self-reliant analysts (`health_score_agent`, `risk_detector_agent`,
@@ -174,7 +195,7 @@ the dev-store tools in `agency/tools.py`, which **announce themselves**
                           ▼
                 csm_human / senior_csm_human / vp_cs_human
                 (HITL — every customer message reviewed before send;
-                 hold / timeout → audit, Manager escalates the tier)
+                 hold → audit; no answer → card closes, nothing sent)
                           │ approve / send / book
                           ▼
                   play_runner_agent  (FINISHER — re-checks approval +
@@ -187,7 +208,7 @@ the dev-store tools in `agency/tools.py`, which **announce themselves**
 Parallel cron responsibilities (NOT in the per-event flow):
 - `renewals_agent` — daily 09:00 window-detection (30/60/90-day accounts).
 - `account_sweep_agent` — daily 07:00 base-wide health sweep, FANNED OUT
-  over `instances: 3` (each copy atomically claims a disjoint batch).
+  over `scaling.copies.count: 3` (each copy atomically claims a disjoint batch).
 - Both crons declare a `timezone` (else they fire in UTC — gotcha #13).
 - `cs_operations_agent` / `customer_onboarding_agent` sweeps — shipped
   with `wake_up` crons commented out; enable after wiring the n8n
@@ -207,7 +228,9 @@ python main.py
 
 The four analysts pull their context from a dev store
 (`agency/_shared/store.py`) seeded with realistic accounts (ACME @ $300K,
-Initech @ $600K with a departed champion, Globex @ $42K, Hooli @ $18K), so
+Initech @ $600K with a departed champion, Globex @ $42K, Hooli @ $18K, plus
+the four accounts the `examples/` payloads use — Bytewing, Orbital Systems,
+Northgate Analytics, Pacific Coast Shipping), so
 their `@pre_compose` context-pulls and `@chain` floors run end-to-end
 before anything is wired. Drive the seeded accounts straight through the
 deterministic layer — no API keys needed:
@@ -285,18 +308,25 @@ curl -X POST http://127.0.0.1:18820/api/mesh/request \
     always recomputed, never trusted from the LLM.
   - **Exec-signature + bounded touch loop** — `save_play_agent`'s
     `@chain` forces a VP personal note on ARR ≥ $500K immediate plays,
-    and caps save-play touches per account (default 3) — past the cap
-    the play escalates to a senior CSM (Rule 3).
+    and caps save-play touches per account: once an account has had 3
+    save-messages sent in 30 days (read from the play history, so it
+    survives restarts and new sessions), the next draft goes to a senior
+    CSM with the reason attached (Rule 3).
 - **Two-signal corroboration on exec turnover** — `account_intel`
   (stakeholder mode) will not confirm a champion change on a single
   non-CRM signal.
-- **HITL fallback is default-deny, never auto-action** — every human's
-  `fallback_response` resolves to `held_for_review` routed to the audit
-  sink; silence never sends. Tier escalation is the Manager supervisor's
-  job (manager.escalation → VP CS), never a hardcoded human→human wire.
+- **Silence never sends** — on leafmesh 2.4.486, when a reviewer does
+  not answer within their window the request waits no longer: its Inbox
+  card closes and the ticket records that no reply came. Nothing is sent
+  or approved, and nobody is chased automatically. Each seat still
+  declares `fallback_response: held_for_review` (routed to audit) as the
+  intended timeout answer. The Manager raises only errors (a hard error,
+  too many failing agents in one session) to `vp_cs_human`; there is no
+  human→human wire.
 - **The finisher fails closed** — `play_runner_agent` runs a play only
   on an explicit approve token (allow-list + block-list; any unknown
-  verdict fails closed) and under the per-account frequency cap. On a
+  verdict fails closed), under the per-account cap (2 plays in 24h), and
+  never sends a save-message with no text. On a
   clean run it renders a real, inspectable artifact to `./out` (and the
   dev-store ledger); a blocked run deletes that partial artifact and
   records the reason — never a half-run file. Verified in
@@ -316,15 +346,18 @@ curl -X POST http://127.0.0.1:18820/api/mesh/request \
   misses.
 - **super_agent** — the `save_play_agent` drafter is wrapped in the
   plan → execute → verify orchestrator (DICT-form tuning only).
-- **instances + atomic claim** — `account_sweep_agent` fans a daily wake
-  into 3 parallel copies that split the account backlog via the
-  thread-locked `claim_account_batch` (no duplicated work).
+- **scaling.copies + atomic claim** — `account_sweep_agent` fans a daily wake
+  into 3 parallel copies (`scaling.copies: {mode: fixed, count: 3, handoff:
+  last}`) that split the account backlog via the thread-locked
+  `claim_account_batch` (no duplicated work). leafmesh 2.4.484's
+  `copies.mode: auto` with `claim_tool:` could replace this manual split; that
+  is an owner decision and is not done here.
 - **timezone** — every live `wake_up` cron declares a timezone so it
   fires in business time, not UTC.
 - **playbooks** — per-intent craft, loaded on demand, on every LLM
   specialist.
 - **mcp (commented) + dev-store tools** — `account_intel_agent` ships a
-  commented CRM `mcp:` block (an empty-url http mcp is rejected at load);
+  commented CRM `mcp:` block (it picks the vault connection `crm_mcp`);
   the `agency/tools.py` dev-store tools are the day-0 fallback and
   announce `available:false` when there's no real source.
 
@@ -341,3 +374,33 @@ YAML) and rule-preservation checks (band + safety floors, exec
 two-signal rule, the play matrix on `risk_detector`'s edges, save-play
 exec-signature rule, renewal strategic safeguard — all asserted to live
 in the YAML prompts/conditions).
+
+## Changing the configuration after the first start
+
+`configs/config.yaml` is only the first-start seed. On the first start (an empty store) the agency imports it as version 1 and from then on keeps its configuration in the store. After that the file is not read again: an edit to it is **not** applied, even after a restart (the boot log says "that edit was NOT applied").
+
+To change a running agency:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.) So wherever this README or a comment says "uncomment X in `configs/config.yaml`", do it in the file before the first start, or in Studio's YAML editor after it.
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in `configs/config.yaml`. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).

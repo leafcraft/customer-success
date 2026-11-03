@@ -6,7 +6,7 @@
     "signal_source": "telemetry",
     "arr_cents": 8400000,
     "segment": "mid_market",
-    "tier": "growth",
+    "tier": "standard",
     "raw_payload": {
       "dau_7d": 142,
       "dau_baseline": 218,

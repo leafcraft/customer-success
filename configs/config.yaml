@@ -35,7 +35,9 @@
 #   1. PEER-TO-PEER mesh — health_score talks directly to
 #      risk_detector; risk_detector's outbound edges ARE the play
 #      matrix; save_play reaches the right CSM tier. The Manager is
-#      the supervisor, not the router.
+#      the supervisor, not the router: it raises repeated or hard
+#      errors to manager.escalation.targets; it does not chase a
+#      reviewer who has not answered.
 #   2. MULTI-ENTRY — 8 entry points (telemetry signals, billing
 #      events, support escalations, scheduled sweeps, QBR cadence,
 #      renewal windows, exec-change CRM updates, manual triggers).
@@ -57,13 +59,13 @@
 #      call renewals_agent for context.
 #   7. CRON CITIZENS + FAN-OUT — renewals_agent runs the daily window
 #      detection; account_sweep_agent runs the base-wide health sweep
-#      FANNED OUT over `instances: 3` (each copy atomically claims a
+#      FANNED OUT over `scaling.copies.count: 3` (each copy atomically claims a
 #      disjoint account batch). Both crons declare a `timezone` so they
 #      fire in business time, not UTC (gotcha #13). The cs_operations /
 #      onboarding sweeps wake once their n8n connectors are wired.
 #   8. MODERN CAPABILITIES — memory (cross-session health on
 #      health_score), super_agent (the save-play drafter), per-intent
-#      playbooks, instances fan-out, and a commented CRM mcp block with
+#      playbooks, scaling.copies fan-out, and a commented CRM mcp block with
 #      day-0 dev-store tools (agency/tools.py) behind it.
 #   9. Event-bus subscribers — every escalation, intervention, and
 #      save-play sent is audited out-of-band for QBR reporting.
@@ -74,21 +76,6 @@ architecture: "managed_mesh"
 environment: "development"
 debug: true
 log_level: "INFO"
-
-# ═══════════════════════════════════════════════════════════════════
-# REDIS — health-score cache, customer context, save-play history
-# ═══════════════════════════════════════════════════════════════════
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400              # keep customer state for a day across signals
-    session_ttl: 604800             # 7 days — long enough for save-play follow-through
 
 # ═══════════════════════════════════════════════════════════════════
 # AUTO-DISCOVER
@@ -149,25 +136,30 @@ manager:
     targets:
       - type: "human_agent"
         agent: "vp_cs_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{customer_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_CS_CHANNEL:}"
-        message_template: "[customer-success] {{message}} — customer {{customer_id}} (session {{session_id}})"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{customer_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
+      # Slack: the channel id is set in .env (SLACK_CS_CHANNEL); posting needs a
+      # Slack channel adapter — connect Slack on a human seat (channels: {slack:
+      # {connection: <vault Slack record>}}, Infrastructure → Messaging → Slack),
+      # then uncomment. Left live with no adapter it only logs an error per alert.
+      # - type: "channel"
+        # provider: "slack"
+        # channel_id: "${SLACK_CS_CHANNEL:}"
+        # message_template: "[customer-success] {{message}} — customer {{customer_id}} (session {{session_id}})"
 
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
 
   health_check_interval: 60
   agent_timeout_threshold: 300
@@ -176,8 +168,9 @@ manager:
 # ═══════════════════════════════════════════════════════════════════
 # MESH
 # ═══════════════════════════════════════════════════════════════════
-mesh:
-  call_timeout: 120
+timeouts:
+  mesh_call_default_timeout_s: 120
+
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -237,7 +230,7 @@ entry_points:
 
   - name: "scheduled_health_sweep"
     target: "account_sweep_agent"
-    description: "Proactive sweep across the whole base — instances fan out over the account backlog (day-0, no connector)"
+    description: "Proactive sweep across the whole base — parallel copies fan out over the account backlog (day-0, no connector)"
 
   - name: "qbr_due"
     target: "qbr_drafter_agent"
@@ -472,14 +465,16 @@ agents:
       health_score: "number"          # 0..100
       score_delta_30d: "number"       # signed
       risk_band: "string"             # healthy | watch | at_risk | critical
-      contributing_factors: "list"
+      contributing_factors: {type: array, items: string}
       confidence: "number"            # 0..1
       customer_id: "string"
       arr_cents: "number"             # carried for downstream tier routing
       segment: "string"
       executive_summary: "string"
-      top_3_contributors: "list"
-      what_changed_30d: "list"
+      top_3_contributors:             # at most 3, biggest driver first
+        type: array
+        items: {type: object, fields: {factor: string, weight_pct: number, recent_trend: string}}
+      what_changed_30d: {type: array, items: string}
       if_we_did_nothing: "string"
       quotable_one_liner: "string"
 
@@ -561,7 +556,9 @@ agents:
           pattern MUST be exactly one of: usage_decay |
           feature_abandonment | support_drag | billing_friction |
           exec_turnover | silent_disengagement | product_misfit |
-          competitor_in_account. NEVER invent a pattern name — the
+          competitor_in_account | approaching_renewal (renewal date
+          inside 90 days and the account needs a renewal play). NEVER
+          invent a pattern name — the
           pattern string drives the play matrix on this agent's
           outbound edges; an unrecognised name routes to hold/audit.
           Drop any candidate that doesn't fit one of these labels.
@@ -635,7 +632,9 @@ agents:
         variables: [customer_id, primary_pattern]
 
     yields:
-      patterns: "list"                     # list of {pattern, severity, evidence}
+      patterns:                            # list of {pattern, severity, evidence}
+        type: array
+        items: {type: object, fields: {pattern: string, severity: number, evidence: string}}
       primary_pattern: "string"
       primary_severity: "number"           # 0..1
       requires_stakeholder_map: "boolean"  # true when champion-loss / exec turnover detected
@@ -667,10 +666,9 @@ agents:
       A "competitor_in_account" pattern fires the immediate save-play
       row of the matrix below (→ save_play_agent), and save_play routes
       the draft to the CSM tier for review before any customer contact.
-      Sales-side awareness of competitor presence is carried by the
-      competitor_intel_agent connector path (its account_risk mode
-      alerts the AE), not by a second human edge here — keeping one
-      route per matrix row.
+      Sales-side awareness of competitor presence is not a second
+      human edge here — one route per matrix row. The CSM who
+      reviews the save-play loops in the AE when needed.
       Urgency guidance for the play the matrix fires (from the CS
       playbook): billing_friction / exec_turnover /
       competitor_in_account are immediate; silent_disengagement,
@@ -877,14 +875,15 @@ agents:
     tool_categories: [cs_context]
 
     # ── REAL CRM / CS-platform connector (day-N). Each named action under
-    #    `use:` becomes its own namespaced tool (e.g. crm_get_contacts). The SDK
-    #    REJECTS an http mcp block with an EMPTY url at load, so this ships
-    #    COMMENTED — set CRM_MCP_URL, then uncomment. Until then the dev-store
+    #    `use:` becomes its own namespaced tool (e.g. crm_get_contacts). The
+    #    server's URL + token live only in the vault: create the connection
+    #    'crm_mcp' on Infrastructure → Integrations → MCP, then uncomment — here
+    #    before the first start, in Studio's YAML editor after it (a URL or
+    #    token written here is refused at load). Until then the dev-store
     #    tools above are the day-0 fallback contract. (gotcha #12) ──
     # mcp:
-    #   - transport: http
-    #     url: "${CRM_MCP_URL}"
-    #     token: "${CRM_MCP_TOKEN:}"
+    #   - connection: crm_mcp
+    #     transport: http
     #     use: [get_contacts, get_opportunities, get_usage]
     #     name: crm
     #     timeout: 30
@@ -917,8 +916,12 @@ agents:
       # expansion responsibility
       customer_id: "string"
       expansion_score: "number"
-      upsell_signals: "list"
-      cross_sell_signals: "list"
+      upsell_signals:
+        type: array
+        items: {type: object, fields: {kind: string, evidence: string, size_hint: string}}
+      cross_sell_signals:
+        type: array
+        items: {type: object, fields: {kind: string, evidence: string, product_hint: string}}
       ae_action_required: "boolean"
       expansion_briefing: "string"
       # stakeholder responsibility
@@ -970,13 +973,14 @@ agents:
   # ────────────────────────────────────────────────────────────
   # save_play_agent — self-reliant LLM, drafts at-risk outreach.
   # agency/save_play_agent.py gives it hands:
-  #   @pre_compose load_play_history — prior plays + the running touch
-  #     count (session stash) so it knows this is touch N, not a first.
+  #   @pre_compose load_play_history — prior plays + the save-messages
+  #     already sent in 30 days, so it knows this is touch N, not a first.
   #   @chain enforce_exec_signature_and_cap — channel/role whitelists,
   #     the exec-signature ARR floor, the thin-draft quality floor, AND
-  #     the BOUNDED touch loop (Rule 3): past the cap the play is forced
-  #     to a senior CSM with an escalation_reason — the Manager's "no
-  #     response after 3 touches" rule, ENFORCED.
+  #     the BOUNDED touch loop (Rule 3): once an account has had 3 sent
+  #     save-messages in 30 days, the next draft goes to a senior CSM
+  #     with an escalation_reason — "no response after 3 touches",
+  #     ENFORCED from the store (it survives restarts and new sessions).
   #   @compose — csm/senior get the draft; vp gets the escalation brief.
   # ────────────────────────────────────────────────────────────
   save_play_agent:
@@ -1075,7 +1079,7 @@ agents:
 
     yields:
       primary_draft: "string"
-      alternative_angles: "list"
+      alternative_angles: {type: array, items: string}
       proposed_channel: "string"        # email | slack | call | inperson
       urgency: "string"
       recipient_role: "string"          # champion | exec_sponsor | new_contact
@@ -1140,7 +1144,7 @@ agents:
     max_completion_tokens: 4000
     communication_type: "chain"
     thinking: true
-    thinking_budget: 8192
+    reasoning_budget: 8192
     reasoning: true
 
     prompt: |
@@ -1165,9 +1169,12 @@ agents:
       open_feedback: "Detailed usage snapshot is pending — will share
       by end of week." Never invent a number to fill the section.
 
+      Echo customer_id unchanged from the input (the CSM inbox and the
+      play_runner that books the QBR read it).
+
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
 
-      {"executive_summary": "", "usage_snapshot": {}, "roi_delivered": [], "roadmap_items": [], "open_feedback": [], "recommended_next_steps": []}
+      {"customer_id": "", "executive_summary": "", "usage_snapshot": {}, "roi_delivered": [], "roadmap_items": [], "open_feedback": [], "recommended_next_steps": []}
 
     enforce_yields: true
     enforce_yields_retry: 2
@@ -1194,12 +1201,13 @@ agents:
         variables: [customer_id]
 
     yields:
+      customer_id: "string"               # identity passthrough — CSM inbox + play_runner
       executive_summary: "string"
       usage_snapshot: "object"
-      roi_delivered: "list"
-      roadmap_items: "list"
-      open_feedback: "list"
-      recommended_next_steps: "list"
+      roi_delivered: {type: array, items: string}
+      roadmap_items: {type: array, items: string}
+      open_feedback: {type: array, items: string}
+      recommended_next_steps: {type: array, items: string}
 
     inputs:
       upstream_yields: "object"
@@ -1332,15 +1340,17 @@ agents:
     yields:
       renewal_probability: "number"        # 0..1
       expansion_mrr_cents: "number"
-      expansion_products: "list"
-      top_factors: "list"
+      expansion_products: {type: array, items: string}
+      top_factors: {type: array, items: string}
       confidence: "number"
       recommendation: "string"             # auto_renew | low_touch | high_touch | save | risk_escalate | window_scan
       # Identity passthrough — renewals_manager / ae inboxes declare customer_id
       customer_id: "string"
       arr_cents: "number"                  # carried so the strategic-account edge can route
       # window-detection responsibility (vacuous on forecast runs)
-      accounts_entering_window: "list"
+      accounts_entering_window:
+        type: array
+        items: {type: object, fields: {customer_id: string, days_to_renewal: number, window: string}}
       windows_triggered: "object"
 
     inputs:
@@ -1402,9 +1412,10 @@ agents:
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-      note: "Standard CSM didn't respond within window — held for review; the Manager SUPERVISOR escalates to senior/VP"
+      note: "No reply from the CSM within 4 hours — held for review; nothing is sent"
 
     yields:
+      edited_draft: "string"             # optional: the full message to send instead of the draft
       decision: "string"                 # approve | send | book | hold
       notes: "string"
       sent_at_utc: "string"
@@ -1415,22 +1426,24 @@ agents:
 
     human_prompt_template: |
       Draft for your review — NOT auto-sent. Please:
-        - Edit for personalisation specific to this customer
+        - Personalise it for this customer: put the full message you want
+          sent in edited_draft (left empty, the draft goes as written)
         - Confirm tone matches the relationship
         - Add anything you've heard from the customer recently
         - Reply 'approve'/'send' to SEND the save-message, 'book' to BOOK
           the QBR (the play_runner executor runs it), or 'hold' to drop.
-          Strategic-account escalation is the Manager's job — you don't
-          hand off to the senior CSM here.
+          Any other reply is recorded and nothing is sent.
+      If nobody answers within 4 hours, the request waits no longer: its
+      Inbox card closes and the ticket records that no reply came. Nothing
+      is sent on silence.
 
     can_call:
       # Human approved → the play_runner EXECUTOR runs the play (send / book).
       - agent: "play_runner_agent"
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
 
-      # Anything else (hold / held_for_review / no-approval) → audit terminus.
-      # Tier escalation is the Manager SUPERVISOR's job (manager.escalation →
-      # vp_cs_human), NEVER a hardcoded human→human wire (dual↔dual, gotcha #17).
+      # Anything else (hold / held_for_review / any other reply) → audit
+      # terminus. No human→human wire (dual↔dual, gotcha #17).
       - agent: "cs_audit_logger_agent"
         condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
 
@@ -1454,9 +1467,10 @@ agents:
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-      note: "Senior CSM didn't respond — held for review; the Manager SUPERVISOR escalates to VP CS"
+      note: "No reply from the senior CSM within 8 hours — held for review; nothing is sent"
 
     yields:
+      edited_draft: "string"             # optional: the full message to send instead of the draft
       decision: "string"
       notes: "string"
       sent_at_utc: "string"
@@ -1467,17 +1481,23 @@ agents:
 
     human_prompt_template: |
       Strategic / named account. Take your time to get it right —
-      a wrong tone here hurts the relationship more than a delay.
+      a wrong tone here hurts the relationship more than a delay. To change
+      the message, put the full text you want sent in edited_draft.
       Reply 'approve'/'send' to SEND, 'book' to BOOK the QBR (play_runner
-      executes), or 'hold' to drop. VP escalation is the Manager's job.
+      executes), or 'hold' to drop. Any other reply is recorded and nothing
+      is sent. An alert with no draft (a strategic score drop, a confirmed
+      champion change) is for your judgment: 'hold' records it; an approval
+      sends nothing, because there is no message text.
+      If nobody answers within 8 hours, the request waits no longer: its
+      Inbox card closes and the ticket records that no reply came. Nothing
+      is sent on silence.
 
     can_call:
       # Senior approved → the play_runner EXECUTOR runs the play.
       - agent: "play_runner_agent"
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'book'"
 
-      # Held / no-approval → audit. VP escalation is the Manager SUPERVISOR's
-      # job (manager.escalation → vp_cs_human), NOT a human→human wire (gotcha #17).
+      # Held / any other reply → audit. No human→human wire (gotcha #17).
       - agent: "cs_audit_logger_agent"
         condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'book'"
 
@@ -1501,7 +1521,7 @@ agents:
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-      note: "Renewals manager didn't respond — held for review; the Manager SUPERVISOR escalates to VP CS"
+      note: "No reply from the renewals manager within 6 hours — held for review; nothing changes on the renewal"
 
     yields:
       decision: "string"                 # forecast_approved | renegotiate | held_for_review
@@ -1512,9 +1532,16 @@ agents:
       renewal_probability: "number"
       top_factors: "list"
 
+    human_prompt_template: |
+      Renewal forecast for your review. Reply 'forecast_approved',
+      'renegotiate' or 'hold' with your notes. Every reply is recorded to
+      the audit log; nothing is sent to the customer from here.
+      If nobody answers within 6 hours, the request waits no longer: its
+      Inbox card closes and the ticket records that no reply came.
+
     can_call:
-      # Every renewals-manager decision is recorded; VP escalation is the
-      # Manager SUPERVISOR's job (manager.escalation), not a human→human wire.
+      # Every renewals-manager decision (and silence) is recorded. No
+      # human→human wire.
       - agent: "cs_audit_logger_agent"
 
   # ────────────────────────────────────────────────────────────
@@ -1548,6 +1575,13 @@ agents:
       expansion_mrr_cents: "number"
       expansion_products: "list"
 
+    human_prompt_template: |
+      Expansion opportunity for your pipeline. Reply 'accept' (you take it
+      as a sales motion), 'decline' or 'hold', with notes. Every reply is
+      recorded to the audit log; nothing is sent to the customer from here.
+      If nobody answers within 4 hours, the request waits no longer: its
+      Inbox card closes and the ticket records that no reply came.
+
     can_call:
       - agent: "cs_audit_logger_agent"
 
@@ -1571,15 +1605,26 @@ agents:
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-      note: "VP CS unavailable — strategic account held for personal review (default-deny)"
+      note: "No reply from the VP CS within 12 hours — strategic play held for review; nothing is sent"
 
     yields:
+      edited_draft: "string"             # optional: the full message to send instead of the draft
       decision: "string"
       directive: "string"
 
     inputs:
       customer_id: "string"
+      draft: "string"
       escalation_reason: "string"
+
+    human_prompt_template: |
+      Strategic save-play (ARR >= $500K, immediate) — to add your personal
+      note, put the full message you want sent in edited_draft. Reply 'approve'/'send' to SEND, 'book' to
+      BOOK a QBR instead, or 'hold' to drop. Any other reply is recorded and
+      nothing is sent.
+      If nobody answers within 12 hours, the request waits no longer: its
+      Inbox card closes and the ticket records that no reply came. Nothing
+      is sent on silence.
 
     can_call:
       # VP approved the strategic play (often after adding a personal
@@ -1598,7 +1643,7 @@ agents:
     agent_type: "external"
     description: "Hash-chained WORM audit sink for every CS decision and customer touch"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
 
     connector_config:
       sink_type: "local_file"
@@ -1620,16 +1665,20 @@ agents:
   # play_runner_agent — the EXECUTOR. The rest of the team drafts +
   # routes; this is the one set of hands that FINISHES the job: after a
   # human approves the play, it RUNS it — SENDS the approved save-message
-  # via the comms connector (${CS_COMMS_WEBHOOK_URL:}) or BOOKS the QBR
-  # via the calendar connector (${CALENDAR_WEBHOOK_URL:}), choosing
-  # send-vs-book from the play type. Both connectors are INERT until set;
-  # the dev-store fallback RECORDS the sent message / booked meeting so
-  # the play produces a real artifact day-0. agency/play_runner_agent.py:
+  # through your comms platform (vault record 'cs_comms_webhook') or BOOKS
+  # the QBR through your calendar (vault record 'cs_calendar_webhook'),
+  # choosing send-vs-book from the play type. Each record is an "Add custom"
+  # record on the Infrastructure page, service type 'Outbound webhook' (base
+  # URL = the address; the token as a secret header row); the Python reads it
+  # with leafmesh.connection_rows. With no record (day 0) the dev-store
+  # fallback RECORDS the sent message / booked meeting so the play produces
+  # a real artifact. agency/play_runner_agent.py:
   #   @pre_compose load_run_context — resolve send vs book, read the
   #     human approval signal, pull executions-in-24h for the cap.
   #   @chain enforce_approval_and_cap — FAIL-CLOSED floor: NEVER run a
   #     play that wasn't human-approved; NEVER exceed the per-account
-  #     daily frequency cap. Drops any artifact when blocked.
+  #     cap (2 plays / 24h); NEVER send an empty message. Drops any
+  #     artifact when blocked.
   # The mesh boundary holds: it talks to a comms / calendar SYSTEM
   # (egress), never to the customer.
   # ────────────────────────────────────────────────────────────
@@ -1668,11 +1717,11 @@ agents:
 
   # ────────────────────────────────────────────────────────────
   # account_sweep_agent — the PROACTIVE base-wide sweep, FANNED OUT.
-  # instances: 3 → one daily wake fans into 3 parallel copies in the SAME
+  # scaling.copies.count: 3 → one daily wake fans into 3 parallel copies in the SAME
   # session; each copy atomically CLAIMS a disjoint batch of accounts from a
   # shared backlog queue (claim_account_batch — LPOP-style, thread-locked) so
   # the copies SPLIT the base instead of all scanning it (gotcha: without a
-  # claim tool the copies duplicate work). Under instances_handoff: last the
+  # claim tool the copies duplicate work). Under scaling.copies.handoff: last the
   # numeric yields SUM and the list yields CONCATENATE, so the combined result
   # is the whole-base digest — no ratios here, so no reshape needed. Terminal to
   # the WORM audit sink (the daily digest CSMs read); per-account deep analysis
@@ -1683,11 +1732,14 @@ agents:
   account_sweep_agent:
     name: "account_sweep_agent"
     agent_type: "programmatic"
-    description: "Proactive base-wide health sweep — instances fan out over the account backlog and flag at-risk accounts for the daily digest"
+    description: "Proactive base-wide health sweep — parallel copies fan out over the account backlog and flag at-risk accounts for the daily digest"
     communication_type: "chain"
-    instances: 3                          # 3 parallel copies per wake
-    instances_handoff: "last"             # COMBINE (sum numbers, concat lists), route once
-    # Daily base sweep. ONE cron line — instances × a multi-entry wake_up list
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                          # 3 parallel copies per wake
+        handoff: last             # COMBINE (sum numbers, concat lists), route once
+    # Daily base sweep. ONE cron line — copies.count × a multi-entry wake_up list
     # would multiply runs (gotcha). timezone is REQUIRED or it fires at 07:00 UTC.
     wake_up: "0 7 * * *"
     timezone: "Asia/Kolkata"
@@ -1735,12 +1787,19 @@ agents:
     description: "CS operations — sweeps the whole base (mode=sweep) and pulls DAU trends, feature breadth, quiet runs for one account (mode=analytics) from your Pendo / Amplitude / Segment stack via n8n"
     communication_type: "chain"
     integration: "n8n"
+    # n8n workflow against YOUR product-analytics stack (Pendo,
+    # Amplitude, Segment, or your warehouse). mode=sweep walks the
+    # active base; mode=analytics computes one account's metrics.
+    # The workflow must respond with JSON in the yields shape below.
+    # To wire it: create the vault connection 'cs_operations_n8n' (on Infrastructure →
+    # Integrations → n8n, or an "Add custom" record with service
+    # type Tools: base URL = the workflow's webhook URL, secret = its auth
+    # token), until it exists the SDK switches this agent off with a notice
+    # (it is never called without an address); it switches on, with no
+    # restart, once the record exists. A
+    # webhook URL or token written here is refused at load.
     connector_config:
-      # n8n workflow against YOUR product-analytics stack (Pendo,
-      # Amplitude, Segment, or your warehouse). mode=sweep walks the
-      # active base; mode=analytics computes one account's metrics.
-      # The workflow must respond with JSON in the yields shape below.
-      webhook_url: "${N8N_CS_OPERATIONS_WEBHOOK_URL:}"
+      connection: cs_operations_n8n
     # Cron decision: the absorbed sweep's 6-hourly schedule is kept
     # but shipped disabled — a cron firing against an unwired webhook
     # only produces noise.
@@ -1802,13 +1861,20 @@ agents:
     description: "Post-sale onboarding milestone tracker + TTFV measurement against your Salesforce / Gainsight CS platform via n8n"
     communication_type: "chain"
     integration: "n8n"
+    # n8n workflow against YOUR CRM / CS platform (Salesforce,
+    # Gainsight). mode=register_close seeds milestones at deal
+    # close; mode=milestone_complete marks one done; mode=sweep
+    # flags overdue milestones + adoption-lagging accounts.
+    # The workflow must respond with JSON in the yields shape below.
+    # To wire it: create the vault connection 'customer_onboarding_n8n' (on Infrastructure →
+    # Integrations → n8n, or an "Add custom" record with service
+    # type Tools: base URL = the workflow's webhook URL, secret = its auth
+    # token), until it exists the SDK switches this agent off with a notice
+    # (it is never called without an address); it switches on, with no
+    # restart, once the record exists. A
+    # webhook URL or token written here is refused at load.
     connector_config:
-      # n8n workflow against YOUR CRM / CS platform (Salesforce,
-      # Gainsight). mode=register_close seeds milestones at deal
-      # close; mode=milestone_complete marks one done; mode=sweep
-      # flags overdue milestones + adoption-lagging accounts.
-      # The workflow must respond with JSON in the yields shape below.
-      webhook_url: "${N8N_CUSTOMER_ONBOARDING_WEBHOOK_URL:}"
+      connection: customer_onboarding_n8n
     # wake_up: "0 9 * * *"   # enable after wiring your Salesforce/Gainsight connector
 
     yields:
@@ -1875,13 +1941,20 @@ agents:
     description: "Records competitor mentions from CSM/support/G2/sales-loss and computes account-level displacement risk in your Klue / Crayon intel platform via n8n"
     communication_type: "chain"
     integration: "n8n"
+    # n8n workflow against YOUR market-intel tooling (Klue, Crayon,
+    # or your CRM's competitor objects). mode=record stores a
+    # mention with channel-weighted severity; mode=account_risk
+    # aggregates 180 days of signals into a displacement score.
+    # The workflow must respond with JSON in the yields shape below.
+    # To wire it: create the vault connection 'competitor_intel_n8n' (on Infrastructure →
+    # Integrations → n8n, or an "Add custom" record with service
+    # type Tools: base URL = the workflow's webhook URL, secret = its auth
+    # token), until it exists the SDK switches this agent off with a notice
+    # (it is never called without an address); it switches on, with no
+    # restart, once the record exists. A
+    # webhook URL or token written here is refused at load.
     connector_config:
-      # n8n workflow against YOUR market-intel tooling (Klue, Crayon,
-      # or your CRM's competitor objects). mode=record stores a
-      # mention with channel-weighted severity; mode=account_risk
-      # aggregates 180 days of signals into a displacement score.
-      # The workflow must respond with JSON in the yields shape below.
-      webhook_url: "${N8N_COMPETITOR_INTEL_WEBHOOK_URL:}"
+      connection: competitor_intel_n8n
 
     yields:
       # Returned by your intel workflow (lenient-filled when absent)
