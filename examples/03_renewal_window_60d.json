@@ -6,9 +6,9 @@
     "signal_source": "renewal_window",
     "arr_cents": 32500000,
     "segment": "enterprise",
-    "tier": "enterprise",
+    "tier": "named_account",
     "raw_payload": {
-      "renewal_date": "2026-08-05",
+      "renewal_date": "2027-01-02",
       "days_to_renewal": 60,
       "current_seats": 145,
       "active_seats_30d": 122,

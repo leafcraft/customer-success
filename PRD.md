@@ -19,9 +19,9 @@ recipient_role is `exec_sponsor`, so the draft lands in
 `senior_csm_human`'s inbox. The senior CSM edits and approves, and the
 `play_runner_agent` finisher sends it (re-checking the approval + the
 per-account cap first). Every hop is appended to the hash-chained WORM
-audit. Had no one responded in 8h, the gate would hold for review
-(default-deny) and the Manager supervisor would escalate to VP CS —
-never auto-act.
+audit. Had no one answered in 8h, the request would wait no longer:
+its Inbox card closes and the ticket records that no reply came.
+Nothing is sent on silence, and nobody is chased automatically.
 
 ## Flow diagram
 
@@ -60,7 +60,7 @@ never auto-act.
                         ▼                            → renewals_manager
             csm_human / senior_csm_human / vp_cs_human
             (HITL — every customer message reviewed before send;
-             hold / timeout → audit, Manager escalates the tier)
+             hold → audit; no answer → card closes, nothing sent)
                         │ approve / send / book
                         ▼
               play_runner_agent  (FINISHER — re-checks approval + cap,
@@ -76,7 +76,7 @@ never auto-act.
 
   Cron citizens (parallel, NOT in the per-event flow; timezone-pinned):
     renewals_agent      — 09:00 daily 30/60/90-day window detection
-    account_sweep_agent — 07:00 daily base-wide sweep, instances: 3
+    account_sweep_agent — 07:00 daily base-wide sweep, scaling.copies.count: 3
                           (each copy claims a disjoint account batch)
     cs_operations / onboarding sweeps — wake_up shipped commented
 ```
@@ -91,7 +91,7 @@ never auto-act.
 | `save_play_agent` | Retention Copywriter | llm (chain) + super_agent |
 | `qbr_drafter_agent` | QBR Author | llm (chain, Claude + thinking) |
 | `renewals_agent` | Renewals Analyst | llm (chain) + 09:00 cron |
-| `account_sweep_agent` | Portfolio Health Sweeper | programmatic + instances: 3 + 07:00 cron |
+| `account_sweep_agent` | Portfolio Health Sweeper | programmatic + scaling.copies.count: 3 + 07:00 cron |
 | `play_runner_agent` | Retention Play Executor (finisher) | programmatic |
 | `csm_human` | Customer Success Manager (standard) | human (dual) |
 | `senior_csm_human` | Senior CSM (named/strategic) | human (dual) |
@@ -105,7 +105,8 @@ never auto-act.
 
 AI specialists are `chain` (a `dual→dual` edge auto-bounces replies — gotcha
 #17); `dual` is confined to the human/webhook boundary. Human tiers do not wire
-to each other — escalation is the Manager supervisor's job.
+to each other; the tier is chosen up front by the routing (ARR, urgency,
+touch count). The Manager raises only errors to `vp_cs_human`.
 
 ## Data artifacts
 
@@ -151,20 +152,25 @@ to each other — escalation is the Manager supervisor's job.
   + timezone) — forecast + expansion sizing + window detection; strategic
   safeguard (no auto_renew ≥ $250K) AND strategic edge (`arr_cents >=
   25000000` → `renewals_manager_human`); window-scan runs are terminal.
-- **account_sweep_agent** (programmatic, `instances: 3`, 07:00 cron +
+- **account_sweep_agent** (programmatic, `scaling.copies.count: 3`, 07:00 cron +
   timezone) — base-wide health sweep; each copy atomically claims a
   disjoint account batch (`claim_account_batch`) and flags at-risk
   accounts; combined digest → audit. The atomic claim is the fan-out
-  contract (numbers SUM, lists CONCAT under `instances_handoff: last`).
+  contract (numbers SUM, lists CONCAT under `scaling.copies.handoff: last`).
 - **play_runner_agent** (programmatic FINISHER) — after a human approves,
-  RUNS the play: SENDS the save-message / BOOKS the QBR and returns the
-  artifact. `@chain` fails closed on an unapproved verdict (allow-token
-  list; unknown → blocked) or an over-cap account, dropping the artifact.
-  Dev-store fallback records the artifact day-0.
-- **Human tiers** — `csm`/`senior_csm`/`renewals_manager`/`ae`/`vp_cs`,
-  each default-deny on timeout (`held_for_review` → audit). Approvals go
-  to `play_runner_agent`; tier escalation is the Manager supervisor's job
-  (manager.escalation → VP CS), never a human→human wire.
+  RUNS the play: SENDS the save-message / BOOKS the QBR through the vault
+  records `cs_comms_webhook` / `cs_calendar_webhook` ('Outbound webhook',
+  read with `leafmesh.connection_rows`) and returns the artifact. `@chain`
+  fails closed on an unapproved verdict (allow-token list; unknown →
+  blocked), an over-cap account (2 plays / 24h) or an empty message,
+  dropping the artifact. Dev-store fallback records the artifact day-0.
+- **Human tiers** — `csm` (4h) / `senior_csm` (8h) / `renewals_manager`
+  (6h) / `ae` (4h) / `vp_cs` (12h). Approvals go to `play_runner_agent`;
+  hold or any other reply → audit. On leafmesh 2.4.486 a reviewer who
+  does not answer in time closes the card and the ticket records that no
+  reply came — nothing is sent or approved. Each seat declares
+  `fallback_response: held_for_review` (→ audit) as the intended timeout
+  answer. No human→human wire.
 - **cs_audit_logger_agent** (external custom) — registered via
   `mesh.intelligence("cs_audit_logger_agent")` in `main.py`; terminal.
 - **Connector agents** (programmatic n8n) — pure YAML; inert until the
@@ -184,8 +190,8 @@ addressable for ad-hoc invocation and debugging.
 
 ## Controls & trust
 
-- Forward-flow DAG; the only back-pressure is human-tier escalation
-  (default-deny, never auto-action).
+- Forward-flow DAG; the only back-edge is the bounded save-play touch
+  loop (3 sent touches in 30 days → senior CSM). Silence never sends.
 - The play matrix is visible conditional wiring on one agent — no
   conductor hub, no hidden Python router.
 - Strategic safeguards: no auto_renew ≥ $250K; strategic forecasts
@@ -204,10 +210,16 @@ addressable for ad-hoc invocation and debugging.
 
 See `README.md` → **Configuration (three tiers)** and the `env` file.
 Tier 1 (license + LLM keys + Redis) is required to boot; Tier 2
-(escalation channels) and Tier 3 (n8n connectors) are optional and
-inert until wired. `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` are
-documented but **not auto-consumed** by the escalation block — wire them
-into a `channels:` adapter to actually post.
+(escalation channels) and Tier 3 (connectors) are optional and
+inert until wired. The Slack escalation target ships commented: it needs
+a connected Slack channel adapter whose bot token lives in a vault Slack
+connection (Infrastructure → Messaging → Slack) — never in `.env` or the
+config.
+The n8n connectors and the CRM `mcp:` block each pick a vault connection
+by name (`cs_operations_n8n`, `customer_onboarding_n8n`,
+`competitor_intel_n8n`, `crm_mcp`); the finisher's comms and calendar
+sends read the 'Outbound webhook' records `cs_comms_webhook` and
+`cs_calendar_webhook`.
 
 ## Reflection / decisions
 
@@ -222,8 +234,8 @@ into a `channels:` adapter to actually post.
     swap n8n/CRM reads into.
   - `@chain` enforces the band/safety/quality floors
     (`_shared/health_math.py`), the strategic-review gate, exec-signature,
-    the bounded save-play touch loop (`_shared/session_stash.py`), and the
-    renewal safeguard + window date gate.
+    the bounded save-play touch loop (sent touches counted from the
+    store's play history), and the renewal safeguard + window date gate.
   - `save_play_agent` uses `@compose` to hand the CSM/senior tiers the
     draft and the VP tier the escalation brief.
   The hash-chained audit sink remains a custom external intelligence
@@ -254,7 +266,7 @@ into a `channels:` adapter to actually post.
 - **Modern capabilities (SDK 2.4.131), fitted to the domain.** memory
   (cross-session health on `health_score_agent`); super_agent (DICT-form)
   on the `save_play_agent` drafter; per-intent `playbook:` blocks
-  replacing the mongo knowledge groups so the pod runs day-0; `instances:
+  replacing the mongo knowledge groups so the pod runs day-0; `scaling.copies.count:
   3` + an atomic claim (`claim_account_batch`) on `account_sweep_agent`
   for backlog fan-out; a `timezone` on every live `wake_up`; a commented
   CRM `mcp:` block on `account_intel_agent` backed by `agency/tools.py`
