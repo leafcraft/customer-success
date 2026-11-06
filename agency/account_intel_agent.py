@@ -3,7 +3,7 @@
 One role, two responsibilities (expansion scanning + stakeholder
 alignment); the input decides which. The expansion floors + the
 two-signal stakeholder rule are deterministic PROMPT rules (see the
-agent's prompt in config.yaml) — by design they are not re-enforced
+agent's prompt in the configuration) — by design they are not re-enforced
 here. What this module adds is the missing hand:
 
 @pre_compose  load_intel_context — pull the RIGHT slice of the account
@@ -21,7 +21,7 @@ here. What this module adds is the missing hand:
               up with the responsibility the LLM will run.
 
 There is no @chain: this agent's floors are intentionally prompt rules
-(the 2.3.x consolidation note in config.yaml). This module is a pure
+(the 2.3.x consolidation note in the configuration). This module is a pure
 context-pull, matching renewals/risk_detector's @pre_compose style.
 """
 from __future__ import annotations

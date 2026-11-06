@@ -1,12 +1,12 @@
-"""account_sweep_agent — the proactive base-wide sweep, FANNED OUT over instances.
+"""account_sweep_agent — the proactive base-wide sweep, FANNED OUT over parallel copies.
 
-`instances: 3` in config.yaml → one daily wake runs this module 3× in parallel
+`scaling.copies.count: 3` in the configuration → one daily wake runs this module 3× in parallel
 in the SAME session. Each copy atomically CLAIMS a disjoint batch of account ids
 from the shared backlog (store.claim_account_batch, thread-locked, keyed by the
 session id so the three copies split one run and the next day's wake re-seeds a
 fresh backlog) and flags the at-risk ones with the DETERMINISTIC health baseline
 (health_math — no LLM needed for a counting sweep). Under
-`instances_handoff: last` the numeric yields SUM and the list yields CONCAT into
+`scaling.copies.handoff: last` the numeric yields SUM and the list yields CONCAT into
 the whole-base digest, routed once to the WORM audit sink.
 
 The atomic claim is ALSO exposed as the `claim_account_batch` @global_tool
@@ -29,7 +29,7 @@ from agency._shared import extract, health_math, store
 
 logger = LeafMeshLogger(__name__)
 
-# Per-instance claim size. Batch >= base means one copy drains the seed base and
+# Per-copy claim size. Batch >= base means one copy drains the seed base and
 # the others honestly report an empty claim — the disjoint-split mechanic; raise
 # it (or shrink batches) against a real multi-thousand-account base.
 _BATCH = int(os.getenv("CS_SWEEP_BATCH", "5") or "5")
@@ -57,7 +57,7 @@ def _evaluate(customer_id: str) -> dict[str, Any]:
 
 
 async def account_sweep_agent(llm_response: Any, input_data: Any, context: Any) -> dict[str, Any]:
-    """Claim this instance's disjoint batch and flag its at-risk accounts.
+    """Claim this copy's disjoint batch and flag its at-risk accounts.
     Deterministic — the model output (if any) is ignored; the sweep is code."""
     # The session id is the run generation: all three copies of one wake share
     # it, so store.claim_account_batch drains ONE backlog across them.
