@@ -2,8 +2,8 @@
 
 Watches the customer base for risk signals BEFORE customers escalate
 or churn. A peer-to-peer TEAM of agents (Rule 1) — the Manager hovers
-above and intervenes only on narration / escalation / contract
-violations.
+above: it raises hard or repeated errors to the VP CS and alerts on
+contract violations; it does not route the work.
 
 Deep AND usable. The play matrix lives on risk_detector's conditional
 edges; the self-reliant LLM agents (health_score, risk_detector,
@@ -33,7 +33,7 @@ from agency._shared import audit_logger as _audit_logger
 load_dotenv()
 logger = LeafMeshLogger(__name__)
 
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # Register the WORM audit sink as the intelligence function for the
 # custom external cs_audit_logger_agent (SDK 2.4+ API).
@@ -74,11 +74,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,   _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,   _on_human_input_timeout)
 
-    try:
-        await leafmesh.enable_self_healing()
-        logger.info("Self-healing enabled (6 graduated recovery actions)")
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     agents = (
         leafmesh.registry.list_agents()

@@ -6,14 +6,14 @@
     "signal_source": "billing",
     "arr_cents": 14200000,
     "segment": "enterprise",
-    "tier": "enterprise",
+    "tier": "named_account",
     "raw_payload": {
       "event_type": "renewal_charge_failed",
       "amount_cents": 1183333,
       "card_last4": "4242",
       "failure_code": "card_declined",
       "retry_attempt": 2,
-      "renewal_date": "2026-06-15"
+      "renewal_date": "2026-11-15"
     }
   }
 }

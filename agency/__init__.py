@@ -1,6 +1,6 @@
 """customer-success — agency package (peer-to-peer team, Rule 1).
 
-YAML-first: 16 agents defined in configs/config.yaml. 6 pure-YAML LLM
+YAML-first: 16 agents defined in the configuration. 6 pure-YAML LLM
 agents (business rules live in their prompts), 3 connector agents (n8n →
 your Pendo/Amplitude, Salesforce/Gainsight, Klue/Crayon stacks), 5
 humans (SDK-handled), 1 external audit sink, and 1 programmatic EXECUTOR

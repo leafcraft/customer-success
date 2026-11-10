@@ -1,19 +1,23 @@
 """save_play_agent — self-reliant save-play drafter.
 
-@pre_compose  load_play_history — pull the account's prior plays + the
-              running touch count from the session stash so the LLM
-              doesn't re-send the same angle and KNOWS this is touch N.
+@pre_compose  load_play_history — pull the account's prior plays + how
+              many save-messages were already SENT to it in the last 30
+              days, so the LLM doesn't re-send the same angle and KNOWS
+              this is touch N.
 @chain        enforce_exec_signature_and_cap — deterministic floors:
               * EXEC-SIGNATURE: ARR >= $500K AND immediate urgency →
                 requires_executive_signature (VP CS personal-note).
               * QUALITY: a thin/short draft is bumped to exec_sponsor so
                 a senior CSM reviews it — never goes out on the standard
                 path.
-              * BOUNDED TOUCH LOOP (Rule 3): each save-play touch on an
-                account increments a session counter; past the cap the
-                play is forced to exec_sponsor and an escalation_reason is
-                set — the Manager's "no response after 3 touches" rule,
-                enforced, not hoped for. Records the play in the store.
+              * BOUNDED TOUCH LOOP (Rule 3): touches = save-messages
+                actually sent to this account in the last 30 days (the
+                store's play history — it survives restarts and new
+                sessions). Once the account has had the cap (default 3)
+                with no resolution, the next draft is forced to
+                exec_sponsor with an escalation_reason, so a senior CSM
+                decides instead of a 4th standard touch. Records the
+                draft in the store.
 @compose      per-tier payloads — csm_human / senior_csm_human (the
               draft to review) vs vp_cs_human (the escalation reason +
               draft for a personal note). Different recipients need
@@ -28,7 +32,7 @@ from typing import Any
 
 from leafmesh import LeafMeshLogger, chain, compose, pre_compose
 
-from agency._shared import extract, session_stash, store
+from agency._shared import extract, store
 
 logger = LeafMeshLogger(__name__)
 
@@ -36,8 +40,10 @@ logger = LeafMeshLogger(__name__)
 EXEC_SIGNATURE_ARR_CENTS = 50_000_000
 # Strategic accounts (ARR > $250K) for the urgency uplift.
 STRATEGIC_ARR_CENTS = 25_000_000
-# A save-play with no customer response must stop after this many touches.
+# A save-play with no customer response stops after this many touches
+# (save-messages sent in the window below); the next one goes to a senior CSM.
 _MAX_TOUCHES = int(os.getenv("CS_SAVE_PLAY_MAX_TOUCHES", "3") or "3")
+_TOUCH_WINDOW_DAYS = 30
 
 VALID_CHANNELS = frozenset({"email", "slack", "call", "inperson"})
 VALID_ROLES = frozenset({"champion", "exec_sponsor", "new_contact"})
@@ -53,8 +59,7 @@ _DEFAULTS: dict[str, Any] = {
 # ── @pre_compose: prior plays + this account's touch count ───────────
 def load_play_history(data: Any, ctx: Any) -> dict[str, Any]:
     customer_id = str(extract.pick(data, "customer_id", ""))
-    sid = extract.session_id(data, ctx)
-    touch_no = session_stash.peek(sid, f"touch:{customer_id}") if customer_id else 0
+    touch_no = store.save_touches(customer_id, _TOUCH_WINDOW_DAYS) if customer_id else 0
     return {
         "customer_id": customer_id,
         "prior_plays": store.prior_plays(customer_id) if customer_id else [],
@@ -98,17 +103,17 @@ async def enforce_exec_signature_and_cap(result: dict[str, Any], ctx: Any) -> di
         result["recipient_role"] = "exec_sponsor"
         logger.warning("[save_play] thin draft — routing to senior review")
 
-    # BOUNDED TOUCH LOOP (Rule 3): count touches; escalate past the cap.
-    sid = extract.session_id(result, ctx)
+    # BOUNDED TOUCH LOOP (Rule 3): count the save-messages already sent to
+    # this account in the window; at the cap, a senior CSM decides.
     if customer_id:
-        touches = session_stash.bump(sid, f"touch:{customer_id}")
-        if touches > _MAX_TOUCHES:
+        touches = store.save_touches(customer_id, _TOUCH_WINDOW_DAYS)
+        if touches >= _MAX_TOUCHES:
             result["recipient_role"] = "exec_sponsor"
             result["escalation_reason"] = (
-                f"{touches} save-play touches with no resolution — escalate "
-                f"to a senior CSM (touch cap {_MAX_TOUCHES} exceeded)."
+                f"{touches} save-play touches in {_TOUCH_WINDOW_DAYS} days with no "
+                f"resolution — a senior CSM decides the next step (touch cap {_MAX_TOUCHES})."
             )
-            logger.warning(f"[save_play] touch cap hit ({touches}) for {customer_id} — escalating")
+            logger.warning(f"[save_play] touch cap hit ({touches}) for {customer_id} — senior review")
         store.record_play(customer_id, "save",
                           pattern=str(extract.pick(result, "primary_pattern", "")),
                           outcome="drafted")
@@ -128,8 +133,11 @@ def _to_csm(result: dict, ctx: dict) -> dict[str, Any]:
 
 
 def _to_vp(result: dict, ctx: dict) -> dict[str, Any]:
+    # The VP adds a personal note to THIS draft — and play_runner sends it on
+    # approval — so the draft must travel with the escalation reason.
     return {
         "customer_id": result.get("customer_id", ""),
+        "draft": result.get("draft", ""),
         "escalation_reason": result.get("escalation_reason", "")
         or "High-ARR save-play needs a VP personal note before send.",
     }
