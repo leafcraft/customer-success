@@ -60,7 +60,7 @@ CALENDAR_RECORD = "cs_calendar_webhook"
 # bookings together): one save-message and one QBR booking a day at most.
 _MAX_PLAYS_PER_DAY = int(os.getenv("CS_MAX_PLAYS_PER_DAY", "2") or "2")
 
-# Approve/deny pair (reference finisher doctrine). A human gate go-token is
+# Approve/deny pair (reference finisher doctrine). A human step go-token is
 # the ONLY thing that runs a play; an explicit block token records WHY it was
 # refused; ANY unknown verdict falls through to fail-closed (not approved).
 _APPROVAL_TOKENS = frozenset({
@@ -95,8 +95,8 @@ _DEFAULTS: dict[str, Any] = {
 
 
 def _approval_signal(data: Any) -> str:
-    """The human gate's go/no-go token, wherever the conductor put it."""
-    for key in ("human_message", "human_decision", "decision"):
+    """The human step's go/no-go token, wherever the conductor put it."""
+    for key in ("verdict", "human_message", "human_decision", "decision"):
         v = extract.pick(data, key, "")
         if v:
             return str(v).strip().lower()

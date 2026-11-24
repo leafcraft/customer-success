@@ -36,9 +36,9 @@ it (fail-closed: it re-checks the approval and the per-account frequency
 cap before any send). Every hop — the score, the pattern, the draft, the
 approval, the send — is appended to the hash-chained
 **cs_audit_logger_agent** WORM log. If the senior CSM had not answered
-within 8 hours, the request would wait no longer: its Inbox card closes
-and the ticket records that no reply came. Nothing is sent on silence,
-and nobody is chased automatically.
+within 8 hours, the seat's default reply, `hold`, would have been recorded
+in the audit log. Nothing is sent on silence, and nobody is chased
+automatically.
 
 Maya never opened a dashboard. She got one reviewed draft for the one
 account that needed her, with the reasoning attached.
@@ -74,7 +74,7 @@ the team's configuration.
 
 | Var | Required | Purpose |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | **required** | SDK license — the mesh refuses to start without it |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | **required** | the `gpt-4o-mini` agents + the manager |
 | `ANTHROPIC_API_KEY` | **required** | `qbr_drafter_agent` (`claude-sonnet-4-6` + thinking) |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | **required** (host defaults `localhost:6379`) | health-score cache, customer context, save-play history, session store |
@@ -120,14 +120,18 @@ only to word an empty answer. Nothing in `.env` switches any of this.
 
 Role = the human job title a VP of Customer Success would recognise.
 Grounded in each agent's actual type, playbook, tools and edges in
-the configuration. Human tiers do not hand off to each other
-(a `dual→dual` footgun, gotcha #17): a gate either approves → the
-finisher, or holds → audit. Which tier a request lands on is decided
-up front by the routing (ARR, urgency, touch count), not by a timeout.
-If a reviewer does not answer within their window, the request waits
-no longer: its Inbox card closes and the ticket records that no reply
-came. Nothing is sent or approved on silence, and nobody is chased
-automatically.
+the configuration. Human tiers do not hand off to each other: a gate
+either approves → the finisher, or holds → audit. Which tier a request
+lands on is decided up front by the routing (ARR, urgency, touch count),
+not by a timeout. The Inbox has no buttons: the reviewer types a reply and
+a small reply reader (`gpt-4o-mini`) turns it into a `verdict` —
+`approve` / `send` / `book` / `hold` on the review seats, `hold` on the
+renewals manager and AE, and `answer` on any seat when the person answered
+an agent's question (it goes back to only the agent that asked). Anything
+that is not a clear yes reads as `hold`. If a reviewer does not answer
+within their window, the seat's default reply (`hold`) goes through its
+routes like any reply and is recorded in the audit log. Nothing is sent or
+approved on silence, and nobody is chased automatically.
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
@@ -139,11 +143,11 @@ automatically.
 | `renewals_agent` | Renewals Analyst | Forecasts renewal probability + expansion sizing (playbook: `renewal_forecast`); strategic safeguard blocks auto-renew on ARR ≥ $250K; daily 09:00 cron (timezone-pinned) detects 30/60/90-day renewal windows | auto_renew + high confidence → audit; expansion → `ae_human`; save/risk → `senior_csm_human`; low-confidence / risk / strategic → `renewals_manager_human` |
 | `account_sweep_agent` | Portfolio Health Sweeper | **Programmatic** base-wide sweep FANNED OUT over `scaling.copies.count: 3`; each copy atomically claims a disjoint account batch (`claim_account_batch`), flags at-risk accounts; daily 07:00 (timezone-pinned) | Combined digest → audit |
 | `play_runner_agent` | Retention Play Executor (finisher) | After a human approves, RUNS the play — SENDS the save-message / BOOKS the QBR through the `cs_comms_webhook` / `cs_calendar_webhook` vault records — renders a real artifact to `./out` and returns it; fail-closed on unapproved / over-cap (2 plays per account per 24h) / empty message (deletes the partial on block); dev-store fallback records the artifact day-0 | → audit (executed or blocked) |
-| `csm_human` | Customer Success Manager (standard accounts) | Reviews, edits and approves drafts for standard accounts before any send | Approve/send/book → `play_runner_agent`; hold or any other reply → audit; no answer in 4h → card closes, nothing sent |
-| `senior_csm_human` | Senior CSM (named / strategic accounts) | Reviews exec-sponsor plays, plays past the touch cap, strategic-drop alerts and confirmed champion changes | Approve/send/book → `play_runner_agent`; hold or any other reply → audit; no answer in 8h → card closes, nothing sent |
-| `renewals_manager_human` | Renewals Manager | Owns the renewal window; reviews every strategic-account forecast and negotiates terms | Every reply → audit; no answer in 6h → card closes |
-| `ae_human` | Account Executive | Owns expansion deals (expansion is a sales motion, never customer-facing CS) | Every reply → audit; no answer in 4h → card closes |
-| `vp_cs_human` | VP Customer Success | Strategic plays (ARR ≥ $500K, immediate) needing a personal note; receives the Manager's error alerts | Approve/send/book → `play_runner_agent`; hold or any other reply → audit; no answer in 12h → card closes, nothing sent |
+| `csm_human` | Customer Success Manager (standard accounts) | Reviews, edits and approves drafts for standard accounts before any send | Approve/send/book → `play_runner_agent`; hold or any other verdict → audit; no answer in 4h → default `hold` → audit, nothing sent |
+| `senior_csm_human` | Senior CSM (named / strategic accounts) | Reviews exec-sponsor plays, plays past the touch cap, strategic-drop alerts and confirmed champion changes | Approve/send/book → `play_runner_agent`; hold or any other verdict → audit; no answer in 8h → default `hold` → audit, nothing sent |
+| `renewals_manager_human` | Renewals Manager | Owns the renewal window; reviews every strategic-account forecast and negotiates terms | Every reply → audit (`answer` goes back to the agent that asked); no answer in 6h → default `hold` → audit |
+| `ae_human` | Account Executive | Owns expansion deals (expansion is a sales motion, never customer-facing CS) | Every reply → audit (`answer` goes back to the agent that asked); no answer in 4h → default `hold` → audit |
+| `vp_cs_human` | VP Customer Success | Strategic plays (ARR ≥ $500K, immediate) needing a personal note; receives the Manager's error alerts | Approve/send/book → `play_runner_agent`; hold or any other verdict → audit; no answer in 12h → default `hold` → audit, nothing sent |
 | `cs_audit_logger_agent` | Compliance Audit Officer | Appends every CS decision and customer touch to a SHA-256 hash-chained WORM log | Terminal sink |
 
 The self-reliant analysts (`health_score_agent`, `risk_detector_agent`,
@@ -193,7 +197,7 @@ the dev-store tools in `agency/tools.py`, which **announce themselves**
                           ▼
                 csm_human / senior_csm_human / vp_cs_human
                 (HITL — every customer message reviewed before send;
-                 hold → audit; no answer → card closes, nothing sent)
+                 hold → audit; no answer → default hold → audit)
                           │ approve / send / book
                           ▼
                   play_runner_agent  (FINISHER — re-checks approval +
@@ -267,7 +271,7 @@ scan = store.accounts_in_renewal_window()
 print("accounts entering renewal window:", [a["customer_id"] for a in scan["accounts"]])
 ```
 
-Once you set `LEAFMESH_LICENSE_KEY` + an LLM key, the same modules run
+Once the mesh is signed in (the first start asks for the licence key) and has an LLM key, the same modules run
 inside the live mesh — trigger a synthetic telemetry signal over HTTP:
 
 ```bash
@@ -320,12 +324,11 @@ curl -X POST http://127.0.0.1:18820/api/mesh/request \
 - **Two-signal corroboration on exec turnover** — `account_intel`
   (stakeholder mode) will not confirm a champion change on a single
   non-CRM signal.
-- **Silence never sends** — on leafmesh 2.4.486, when a reviewer does
-  not answer within their window the request waits no longer: its Inbox
-  card closes and the ticket records that no reply came. Nothing is sent
-  or approved, and nobody is chased automatically. Each seat still
-  declares `fallback_response: held_for_review` (routed to audit) as the
-  intended timeout answer. The Manager raises only errors (a hard error,
+- **Silence never sends** — when a reviewer does not answer within their
+  window, the seat's `fallback_response` (`verdict: hold`,
+  `held_for_review`) goes through its routes like any reply and is
+  recorded in the audit log. Nothing is sent or approved, and nobody is
+  chased automatically. The Manager raises only errors (a hard error,
   too many failing agents in one session) to `vp_cs_human`; there is no
   human→human wire.
 - **The finisher fails closed** — `play_runner_agent` runs a play only

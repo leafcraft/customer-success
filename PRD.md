@@ -19,8 +19,8 @@ recipient_role is `exec_sponsor`, so the draft lands in
 `senior_csm_human`'s inbox. The senior CSM edits and approves, and the
 `play_runner_agent` finisher sends it (re-checking the approval + the
 per-account cap first). Every hop is appended to the hash-chained WORM
-audit. Had no one answered in 8h, the request would wait no longer:
-its Inbox card closes and the ticket records that no reply came.
+audit. Had no one answered in 8h, the seat's default reply, `hold`,
+would have been recorded in the audit log.
 Nothing is sent on silence, and nobody is chased automatically.
 
 ## Flow diagram
@@ -60,7 +60,7 @@ Nothing is sent on silence, and nobody is chased automatically.
                         ▼                            → renewals_manager
             csm_human / senior_csm_human / vp_cs_human
             (HITL — every customer message reviewed before send;
-             hold → audit; no answer → card closes, nothing sent)
+             hold → audit; no answer → default hold → audit)
                         │ approve / send / book
                         ▼
               play_runner_agent  (FINISHER — re-checks approval + cap,
@@ -93,19 +93,20 @@ Nothing is sent on silence, and nobody is chased automatically.
 | `renewals_agent` | Renewals Analyst | llm (chain) + 09:00 cron |
 | `account_sweep_agent` | Portfolio Health Sweeper | programmatic + scaling.copies.count: 3 + 07:00 cron |
 | `play_runner_agent` | Retention Play Executor (finisher) | programmatic |
-| `csm_human` | Customer Success Manager (standard) | human (dual) |
-| `senior_csm_human` | Senior CSM (named/strategic) | human (dual) |
-| `renewals_manager_human` | Renewals Manager | human (dual) |
-| `ae_human` | Account Executive | human (dual) |
-| `vp_cs_human` | VP Customer Success | human (dual) |
+| `csm_human` | Customer Success Manager (standard) | human (chain + reply reader) |
+| `senior_csm_human` | Senior CSM (named/strategic) | human (chain + reply reader) |
+| `renewals_manager_human` | Renewals Manager | human (chain + reply reader) |
+| `ae_human` | Account Executive | human (chain + reply reader) |
+| `vp_cs_human` | VP Customer Success | human (chain + reply reader) |
 | `cs_audit_logger_agent` | Compliance Audit Officer | external (custom) |
 | `cs_operations_agent` | CS Operations Analyst (telemetry) | programmatic (n8n) |
 | `customer_onboarding_agent` | Onboarding Manager | programmatic (n8n) |
 | `competitor_intel_agent` | Competitive Intelligence Analyst | programmatic (n8n) |
 
-AI specialists are `chain` (a `dual→dual` edge auto-bounces replies — gotcha
-#17); `dual` is confined to the human/webhook boundary. Human tiers do not wire
-to each other; the tier is chosen up front by the routing (ARR, urgency,
+Every agent is `chain`. A person seat has a `reply_reader` (`gpt-4o-mini`)
+that turns the typed Inbox reply into a `verdict`; the routes read `verdict`.
+`answer` (the person answered an agent's question) goes back to only the agent
+that asked. Human tiers do not wire to each other; the tier is chosen up front by the routing (ARR, urgency,
 touch count). The Manager raises only errors to `vp_cs_human`.
 
 ## Data artifacts
@@ -166,11 +167,10 @@ touch count). The Manager raises only errors to `vp_cs_human`.
   dropping the artifact. Dev-store fallback records the artifact day-0.
 - **Human tiers** — `csm` (4h) / `senior_csm` (8h) / `renewals_manager`
   (6h) / `ae` (4h) / `vp_cs` (12h). Approvals go to `play_runner_agent`;
-  hold or any other reply → audit. On leafmesh 2.4.486 a reviewer who
-  does not answer in time closes the card and the ticket records that no
-  reply came — nothing is sent or approved. Each seat declares
-  `fallback_response: held_for_review` (→ audit) as the intended timeout
-  answer. No human→human wire.
+  hold or any other verdict → audit. When a reviewer does not answer in
+  time, the seat's `fallback_response` (`verdict: hold`, `held_for_review`)
+  goes through its routes like any reply and lands in the audit log —
+  nothing is sent or approved. No human→human wire.
 - **cs_audit_logger_agent** (external custom) — registered via
   `mesh.intelligence("cs_audit_logger_agent")` in `main.py`; terminal.
 - **Connector agents** (programmatic n8n) — pure YAML; inert until the
@@ -203,7 +203,7 @@ addressable for ad-hoc invocation and debugging.
   the bounded save-play touch loop, the renewal safeguard + window date
   gate) — the prompts still state the rules so the model is grounded.
 - Hash-chained WORM audit terminus on every branch.
-- HITL gates carry no placeholder `operator_ids` — unset routes to the
+- Human steps carry no placeholder `operator_ids` — unset routes to the
   shared inbox (placeholder emails would make tasks invisible).
 
 ## Configuration pointer
